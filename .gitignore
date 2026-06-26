@@ -1,0 +1,18 @@
+# Environments
+venv/
+.env
+
+# PyInstaller / Build Artifacts
+build/
+dist/
+*.spec
+__pycache__/
+*.pyc
+
+# Local files & logs
+*.log
+~$*.xlsx
+*.xlsx.tmp
+.vscode/
+.idea/
+Thumbs.db
