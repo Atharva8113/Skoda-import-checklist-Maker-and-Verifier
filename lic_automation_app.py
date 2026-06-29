@@ -259,7 +259,6 @@ class LicenseAutomationApp:
         # Tab 1: License Automation
         tab_automation = ttk.Frame(notebook)
         notebook.add(tab_automation, text="License Automation")
-        
         # Tab 2: Database Master
         tab_db = ttk.Frame(notebook)
         notebook.add(tab_db, text="Database Master")
