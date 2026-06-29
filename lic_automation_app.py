@@ -206,27 +206,60 @@ class LicenseAutomationApp:
         header_frame.pack(fill='x', side='top')
         header_frame.pack_propagate(False)
         
+        # White container box for logo
+        logo_container = tk.Frame(header_frame, bg='#FFFFFF', bd=0)
+        logo_container.pack(side='left', padx=20, pady=10, fill='y')
+        
         # Logo handling (PIL-free fallback)
         logo_loaded = False
         logo_path = os.path.join(os.path.dirname(os.path.abspath(__file__)) if '__file__' in globals() else os.getcwd(), "logo.png")
         if os.path.exists(logo_path):
             try:
                 self.logo_img = tk.PhotoImage(file=logo_path)
-                if self.logo_img.width() > 150 or self.logo_img.height() > 150:
-                    self.logo_img = self.logo_img.subsample(3)
+                if self.logo_img.width() > 200 or self.logo_img.height() > 60:
+                    self.logo_img = self.logo_img.subsample(2)
                 
-                logo_label = tk.Label(header_frame, image=self.logo_img, bg=COLOR_PRIMARY)
-                logo_label.pack(side='left', padx=20, pady=5)
+                logo_label = tk.Label(logo_container, image=self.logo_img, bg='#FFFFFF')
+                logo_label.pack(padx=15, pady=5, expand=True)
                 logo_loaded = True
             except Exception as e:
                 print(f"Warning: Logo failed to load: {e}")
         
         if not logo_loaded:
-            logo_label = tk.Label(header_frame, text="NAGARKOT", fg="#FFFFFF", bg=COLOR_PRIMARY, font=(FONT_FAMILY, 14, 'bold'))
-            logo_label.pack(side='left', padx=25, pady=20)
+            logo_label = tk.Label(logo_container, text=" NAGARKOT ", fg=COLOR_PRIMARY, bg='#FFFFFF', font=(FONT_FAMILY, 14, 'bold'))
+            logo_label.pack(padx=15, pady=8, expand=True)
             
-        title_label = ttk.Label(header_frame, text="SKODA LICENSE AUTOMATION TOOL", style='Header.TLabel')
-        title_label.pack(side='left', expand=True, fill='x', padx=20)
+        # Centered Text Frame for Title and Subtitle
+        text_frame = tk.Frame(header_frame, bg=COLOR_PRIMARY)
+        text_frame.pack(side='left', expand=True, fill='both', pady=12)
+        
+        title_label = tk.Label(
+            text_frame, 
+            text="SHAKTI SKODA LICENSE MANAGER", 
+            fg="#FFFFFF", 
+            bg=COLOR_PRIMARY, 
+            font=(FONT_FAMILY, 16, 'bold'),
+            anchor='center'
+        )
+        title_label.pack(fill='x', expand=True)
+        
+        subtitle_label = tk.Label(
+            text_frame, 
+            text="Nagarkot Forwarders License Exemption & Debit Utility", 
+            fg="#A0C4DF", 
+            bg=COLOR_PRIMARY, 
+            font=(FONT_FAMILY, 9, 'italic'),
+            anchor='center'
+        )
+        subtitle_label.pack(fill='x', expand=True)
+        
+        # Right spacer to balance the left logo container and keep text perfectly centered
+        right_spacer = tk.Frame(header_frame, bg=COLOR_PRIMARY, width=150)
+        right_spacer.pack(side='right', fill='y')
+        
+        # Subtle light/medium blue divider bar under header
+        accent_line = tk.Frame(self.root, bg=COLOR_SECONDARY, height=4)
+        accent_line.pack(fill='x', side='top')
         
         # --- NOTEBOOK FOR TABS ---
         notebook = ttk.Notebook(self.root)
