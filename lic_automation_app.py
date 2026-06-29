@@ -795,6 +795,9 @@ class LicenseAutomationApp:
                 lic_no = str(row_list[lic_col]).replace(".0", "").strip()
                 if not lic_no:
                     continue
+                # Skip non-numeric rows like "Legend" headers
+                if not lic_no.isdigit():
+                    continue
                 
                 raw_date = row_list[date_col]
                 if pd.isna(raw_date):
@@ -1788,10 +1791,28 @@ class LicenseAutomationApp:
     def _run_license_automation_success(self, output_jd_path):
         self.root.config(cursor="")
         self.load_btn.config(state='normal')
-        self.run_btn.config(state='normal')
+        self.run_btn.config(state='disabled')
         
         messagebox.showinfo("Success", f"License automation finished successfully!\n\n1. JobData updated and saved to:\n{os.path.basename(output_jd_path)}\n\n2. Google Sheets updated successfully in cloud.")
-        self.load_and_analyze_data()
+        
+        # Clear input file paths after successful processing
+        self.job_data_path.set("")
+        self.item_report_path.set("")
+        self.job_info = None
+        self.active_licenses = []
+        self.item_duties = []
+        self.required_duty = 0.0
+        self.selected_duty_covered = 0.0
+        self.estimated_debit = 0.0
+        
+        # Clear treeview and summary
+        for item_id in self.lic_tree.get_children():
+            self.lic_tree.delete(item_id)
+        for widget in self.summary_text_frame.winfo_children():
+            widget.destroy()
+        ttk.Label(self.summary_text_frame, text="Please load the JobData and Item Report files to view summary.", style='Summary.TLabel').pack(anchor='w', pady=10)
+        
+        self.log("All inputs cleared. Ready for next job.")
 
     def _run_license_automation_failure(self, error_msg):
         self.root.config(cursor="")
