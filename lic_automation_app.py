@@ -2,9 +2,29 @@ import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 import os
 import re
+import json
+import requests
 import pandas as pd
 import openpyxl
+import threading
 from datetime import datetime, timedelta
+
+def safe_float(val):
+    if val is None:
+        return 0.0
+    if isinstance(val, (int, float)):
+        if val != val:
+            return 0.0
+        return float(val)
+    val_str = str(val).strip()
+    if not val_str:
+        return 0.0
+    # Remove commas and spaces
+    val_str = val_str.replace(',', '').replace(' ', '')
+    try:
+        return float(val_str)
+    except ValueError:
+        return 0.0
 
 # --- MONKEYPATCH FOR OPENPYXL TO WRITE FORMULA CACHED VALUES ---
 from xml.etree.ElementTree import Element, SubElement
@@ -79,17 +99,40 @@ COLOR_ACCENT = "#17B978"        # Green accent for success / action
 COLOR_ERROR = "#FF4D4D"         # Red accent for error
 FONT_FAMILY = "Segoe UI"
 
+CONFIG_FILE = "config.json"
+
+def load_config():
+    if os.path.exists(CONFIG_FILE):
+        try:
+            with open(CONFIG_FILE, 'r') as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {"google_sheet_url": "", "security_token": "NagarkotSkoda2026"}
+
+def save_config(config):
+    try:
+        with open(CONFIG_FILE, 'w') as f:
+            json.dump(config, f, indent=4)
+    except Exception:
+        pass
+
 class LicenseAutomationApp:
     def __init__(self, root: tk.Tk):
         self.root = root
         self.root.title("Nagarkot Skoda License Automation Tool")
-        self.root.geometry("1100x820")
+        self.root.geometry("1100x850")
         self.root.configure(bg=COLOR_BG)
+        
+        # Configuration
+        self.config = load_config()
+        self.google_sheet_url = tk.StringVar(value=self.config.get("google_sheet_url", ""))
+        self.security_token = tk.StringVar(value=self.config.get("security_token", "NagarkotSkoda2026"))
         
         # State Variables
         self.job_data_path = tk.StringVar()
         self.item_report_path = tk.StringVar()
-        self.scrip_master_path = tk.StringVar()
+        self.new_lic_excel_path = tk.StringVar()
         
         self.job_info = {}
         self.active_licenses = []
@@ -100,6 +143,10 @@ class LicenseAutomationApp:
         
         self.create_styles()
         self.build_ui()
+        
+        # Initial database view load if configured
+        if self.google_sheet_url.get().strip():
+            self.refresh_db_view()
 
     def create_styles(self):
         """Configure custom styles for ttk widgets."""
@@ -164,9 +211,7 @@ class LicenseAutomationApp:
         logo_path = os.path.join(os.path.dirname(os.path.abspath(__file__)) if '__file__' in globals() else os.getcwd(), "logo.png")
         if os.path.exists(logo_path):
             try:
-                # PhotoImage natively supports PNG
                 self.logo_img = tk.PhotoImage(file=logo_path)
-                # Resize if necessary (subsample or zoom, e.g. subsample 3 to reduce size if it's too big)
                 if self.logo_img.width() > 150 or self.logo_img.height() > 150:
                     self.logo_img = self.logo_img.subsample(3)
                 
@@ -177,15 +222,26 @@ class LicenseAutomationApp:
                 print(f"Warning: Logo failed to load: {e}")
         
         if not logo_loaded:
-            # Stylized text placeholder for logo
             logo_label = tk.Label(header_frame, text="NAGARKOT", fg="#FFFFFF", bg=COLOR_PRIMARY, font=(FONT_FAMILY, 14, 'bold'))
             logo_label.pack(side='left', padx=25, pady=20)
             
         title_label = ttk.Label(header_frame, text="SKODA LICENSE AUTOMATION TOOL", style='Header.TLabel')
         title_label.pack(side='left', expand=True, fill='x', padx=20)
         
-        # --- MAIN CONTAINER ---
-        main_frame = ttk.Frame(self.root, padding="15")
+        # --- NOTEBOOK FOR TABS ---
+        notebook = ttk.Notebook(self.root)
+        notebook.pack(fill='both', expand=True, padx=15, pady=5)
+        
+        # Tab 1: License Automation
+        tab_automation = ttk.Frame(notebook)
+        notebook.add(tab_automation, text="License Automation")
+        
+        # Tab 2: Database Master
+        tab_db = ttk.Frame(notebook)
+        notebook.add(tab_db, text="Database Master")
+        
+        # --- TAB 1 CONTENT (LICENSE AUTOMATION) ---
+        main_frame = ttk.Frame(tab_automation, padding="10")
         main_frame.pack(fill='both', expand=True)
         
         # Left Panel (Inputs and Job Details)
@@ -212,15 +268,22 @@ class LicenseAutomationApp:
         ttk.Entry(row_ir, textvariable=self.item_report_path).pack(side='left', fill='x', expand=True, padx=5)
         ttk.Button(row_ir, text="Browse", command=self.browse_item_report).pack(side='left')
         
-        # Scrip Master Path Input
-        row_sm = ttk.Frame(files_card, style='Card.TFrame')
-        row_sm.pack(fill='x', pady=5)
-        ttk.Label(row_sm, text="Scrip Master Excel:", width=18, anchor='w', style='Summary.TLabel').pack(side='left')
-        ttk.Entry(row_sm, textvariable=self.scrip_master_path).pack(side='left', fill='x', expand=True, padx=5)
-        ttk.Button(row_sm, text="Browse", command=self.browse_scrip_master).pack(side='left')
+        # Select Scheme Dropdown Input
+        self.scheme_selection = tk.StringVar(value="Auto-Detect")
+        row_scheme = ttk.Frame(files_card, style='Card.TFrame')
+        row_scheme.pack(fill='x', pady=5)
+        ttk.Label(row_scheme, text="License Scheme:", width=18, anchor='w', style='Summary.TLabel').pack(side='left')
+        scheme_dropdown = ttk.Combobox(
+            row_scheme, 
+            textvariable=self.scheme_selection, 
+            values=["Auto-Detect", "RODTEP", "ROSCTL", "DFIA", "EPCG", "ADVANCE AUTHORISATION"],
+            state="readonly"
+        )
+        scheme_dropdown.pack(side='left', fill='x', expand=True, padx=5)
         
         # Load Data Button
-        ttk.Button(files_card, text="LOAD AND ANALYZE FILES", command=self.load_and_analyze_data).pack(fill='x', pady=(15, 0))
+        self.load_btn = ttk.Button(files_card, text="LOAD AND ANALYZE FILES", command=self.load_and_analyze_data)
+        self.load_btn.pack(fill='x', pady=(15, 0))
         
         # Card 2: Job details summary
         self.summary_card = ttk.Frame(left_panel, style='Card.TFrame', padding="15")
@@ -243,14 +306,13 @@ class LicenseAutomationApp:
         lic_card = ttk.Frame(right_panel, style='Card.TFrame', padding="15")
         lic_card.pack(fill='both', expand=True, side='top', pady=(0, 10))
         
-        ttk.Label(lic_card, text="Active Licenses in Scrip Master", style='Section.TLabel').pack(anchor='w', pady=(0, 5))
+        ttk.Label(lic_card, text="Active Licenses (Fetched from Cloud)", style='Section.TLabel').pack(anchor='w', pady=(0, 5))
         ttk.Label(lic_card, text="Sorts automatically by expiry date. Check/uncheck to select licenses for allocation.", font=(FONT_FAMILY, 9, 'italic'), foreground="#666666").pack(anchor='w', pady=(0, 10))
         
         # Treeview for active licenses
         tree_scroll = ttk.Scrollbar(lic_card)
         tree_scroll.pack(side='right', fill='y')
         
-        # Tree view with columns
         self.lic_tree = ttk.Treeview(
             lic_card, 
             columns=('selected', 'lic_no', 'port', 'type', 'balance', 'expiry'), 
@@ -261,7 +323,6 @@ class LicenseAutomationApp:
         self.lic_tree.pack(fill='both', expand=True)
         tree_scroll.config(command=self.lic_tree.yview)
         
-        # Configure Treeview tags for custom coloring and formatting
         self.lic_tree.tag_configure('near_expiry', foreground=COLOR_ERROR)
         self.lic_tree.tag_configure('checked', background="#E8F5E9")
         
@@ -281,7 +342,6 @@ class LicenseAutomationApp:
         self.lic_tree.column('balance', width=130, anchor='e')
         self.lic_tree.column('expiry', width=110, anchor='center')
         
-        # Row double-click or single-click to toggle checkbox
         self.lic_tree.bind("<ButtonRelease-1>", self.on_tree_click)
         
         # Card 4: Run Actions and Live log
@@ -299,22 +359,134 @@ class LicenseAutomationApp:
         self.log_txt = tk.Text(run_card, height=8, wrap='word', yscrollcommand=log_scroll.set, font=('Consolas', 9), bg='#FAF9F6', fg='#333333', borderwidth=1, relief='solid')
         self.log_txt.pack(fill='x')
         log_scroll.config(command=self.log_txt.yview)
+        self.log("System initialized. Configure Google Sheets URL, load data to begin.")
         
-        # Add basic greeting to log
-        self.log("System initialized. Select files and load data to begin.")
-
+        # --- TAB 2 CONTENT (DATABASE MASTER) ---
+        db_main_frame = ttk.Frame(tab_db, padding="10")
+        db_main_frame.pack(fill='both', expand=True)
+        
+        # Top Card: Configuration
+        config_card = ttk.Frame(db_main_frame, style='Card.TFrame', padding="10")
+        config_card.pack(fill='x', side='top', pady=(0, 10))
+        
+        ttk.Label(config_card, text="Google Sheets Database Configuration", style='Section.TLabel').pack(anchor='w', pady=(0, 5))
+        
+        row_url = ttk.Frame(config_card, style='Card.TFrame')
+        row_url.pack(fill='x', pady=2)
+        ttk.Label(row_url, text="Google Web App URL:", width=22, anchor='w', style='Summary.TLabel').pack(side='left')
+        ttk.Entry(row_url, textvariable=self.google_sheet_url).pack(side='left', fill='x', expand=True, padx=5)
+        ttk.Button(row_url, text="Save Configuration", command=self.save_app_config).pack(side='left')
+        
+        # Middle Card: Spreadsheet View
+        sheet_card = ttk.Frame(db_main_frame, style='Card.TFrame', padding="15")
+        sheet_card.pack(fill='both', expand=True, side='top', pady=(0, 10))
+        
+        row_sheet_hdr = ttk.Frame(sheet_card, style='Card.TFrame')
+        row_sheet_hdr.pack(fill='x', pady=(0, 5))
+        ttk.Label(row_sheet_hdr, text="Spreadsheet View (Licenses in Cloud)", style='Section.TLabel').pack(side='left')
+        ttk.Button(row_sheet_hdr, text="Refresh Database View", command=self.refresh_db_view).pack(side='right')
+        
+        # Treeview for viewing all columns in Data sheet
+        sheet_scroll_y = ttk.Scrollbar(sheet_card, orient='vertical')
+        sheet_scroll_y.pack(side='right', fill='y')
+        sheet_scroll_x = ttk.Scrollbar(sheet_card, orient='horizontal')
+        sheet_scroll_x.pack(side='bottom', fill='x')
+        
+        self.db_tree = ttk.Treeview(
+            sheet_card,
+            columns=('lic_no', 'lic_date', 'port', 'type', 'value', 'expiry', 'no_boe', 'used_val', 'balance', 'job_no'),
+            show='headings',
+            yscrollcommand=sheet_scroll_y.set,
+            xscrollcommand=sheet_scroll_x.set
+        )
+        self.db_tree.pack(fill='both', expand=True)
+        sheet_scroll_y.config(command=self.db_tree.yview)
+        sheet_scroll_x.config(command=self.db_tree.xview)
+        
+        # DB View Columns Headers
+        self.db_tree.heading('lic_no', text="License No")
+        self.db_tree.heading('lic_date', text="Lic Date")
+        self.db_tree.heading('port', text="Port")
+        self.db_tree.heading('type', text="Type")
+        self.db_tree.heading('value', text="Value (INR)")
+        self.db_tree.heading('expiry', text="Expiry Date")
+        self.db_tree.heading('no_boe', text="Count of Job")
+        self.db_tree.heading('used_val', text="Used Value (INR)")
+        self.db_tree.heading('balance', text="Balance (INR)")
+        self.db_tree.heading('job_no', text="Job List")
+        
+        # Column width / align
+        self.db_tree.column('lic_no', width=120, anchor='center')
+        self.db_tree.column('lic_date', width=90, anchor='center')
+        self.db_tree.column('port', width=80, anchor='center')
+        self.db_tree.column('type', width=90, anchor='center')
+        self.db_tree.column('value', width=110, anchor='e')
+        self.db_tree.column('expiry', width=100, anchor='center')
+        self.db_tree.column('no_boe', width=80, anchor='center')
+        self.db_tree.column('used_val', width=120, anchor='e')
+        self.db_tree.column('balance', width=120, anchor='e')
+        self.db_tree.column('job_no', width=200, anchor='w')
+        
+        # Bottom Card: Add Licenses Options (Side by side)
+        add_card = ttk.Frame(db_main_frame, style='Card.TFrame', padding="10")
+        add_card.pack(fill='x', side='bottom')
+        
+        ttk.Label(add_card, text="Add New Licenses to Cloud", style='Section.TLabel').pack(anchor='w', pady=(0, 10))
+        
+        # Left half: Paste Text
+        paste_frame = ttk.Frame(add_card, style='Card.TFrame')
+        paste_frame.pack(side='left', fill='both', expand=True, padx=(0, 10))
+        
+        ttk.Label(paste_frame, text="Method A: Paste License Rows (Tab or Comma separated)\nOrder: LICNO/ | LIC Date | Port | Type | Value | [Expiry Date]", justify='left', style='Summary.TLabel').pack(anchor='w', pady=(0, 5))
+        
+        self.paste_txt = tk.Text(paste_frame, height=5, wrap='none', font=('Consolas', 9), bg='#FFFFFF', fg='#333333', borderwidth=1, relief='solid')
+        self.paste_txt.pack(fill='both', expand=True, pady=5)
+        
+        self.paste_btn = ttk.Button(paste_frame, text="Push Pasted Licenses to Cloud", command=self.push_pasted_licenses)
+        self.paste_btn.pack(fill='x')
+        
+        # Right half: Excel upload
+        excel_frame = ttk.Frame(add_card, style='Card.TFrame')
+        excel_frame.pack(side='right', fill='both', expand=True, padx=(10, 0))
+        
+        ttk.Label(excel_frame, text="Method B: Select Excel file with license sheets", style='Summary.TLabel').pack(anchor='w', pady=(0, 5))
+        
+        row_pick = ttk.Frame(excel_frame, style='Card.TFrame')
+        row_pick.pack(fill='x', pady=5)
+        ttk.Entry(row_pick, textvariable=self.new_lic_excel_path).pack(side='left', fill='x', expand=True, padx=(0, 5))
+        ttk.Button(row_pick, text="Browse", command=self.browse_new_lic_excel).pack(side='left')
+        
+        ttk.Label(excel_frame, text="Supported headers: LICNO/, LIC Date, Port, Type, Value, Expiry Date\nEnsure headers or columns align correctly.", font=(FONT_FAMILY, 8, 'italic'), foreground="#777777").pack(anchor='w', pady=5)
+        
+        self.excel_btn = ttk.Button(excel_frame, text="Import and Push Excel to Cloud", command=self.push_excel_licenses)
+        self.excel_btn.pack(fill='x')
+        
         # --- FOOTER BLOCK ---
         footer_frame = tk.Frame(self.root, bg="#E2E2E2", height=30)
         footer_frame.pack(fill='x', side='bottom')
         footer_frame.pack_propagate(False)
         
-        footer_label = tk.Label(footer_frame, text="Developed for Skoda Imports Automation | Version 1.0.0", bg="#E2E2E2", fg="#555555", font=(FONT_FAMILY, 9))
+        footer_label = tk.Label(footer_frame, text="Developed for Skoda Imports Automation | Central Google Sheet Mode", bg="#E2E2E2", fg="#555555", font=(FONT_FAMILY, 9))
         footer_label.pack(pady=5)
 
     def log(self, msg: str):
         """Append a message to the logging pane."""
         self.log_txt.insert(tk.END, f"[{datetime.now().strftime('%H:%M:%S')}] {msg}\n")
         self.log_txt.see(tk.END)
+
+    def safe_log(self, msg: str):
+        """Append a message to the logging pane safely from any thread."""
+        self.root.after(0, lambda: self.log(msg))
+
+    def save_app_config(self):
+        url = self.google_sheet_url.get().strip()
+        token = self.security_token.get().strip()
+        self.config["google_sheet_url"] = url
+        self.config["security_token"] = token
+        save_config(self.config)
+        messagebox.showinfo("Success", "Configuration saved successfully!")
+        if url:
+            self.refresh_db_view()
 
     def browse_job_data(self):
         filename = filedialog.askopenfilename(title="Select JobData Excel File", filetypes=[("Excel Files", "*.xlsx")])
@@ -326,10 +498,395 @@ class LicenseAutomationApp:
         if filename:
             self.item_report_path.set(filename)
 
-    def browse_scrip_master(self):
-        filename = filedialog.askopenfilename(title="Select Scrip Master Excel", filetypes=[("Excel Files", "*.xlsx")])
+    def browse_new_lic_excel(self):
+        filename = filedialog.askopenfilename(title="Select Excel File with New Licenses", filetypes=[("Excel Files", "*.xlsx")])
         if filename:
-            self.scrip_master_path.set(filename)
+            self.new_lic_excel_path.set(filename)
+
+    def parse_sheet_date(self, date_str):
+        if not date_str:
+            return None
+        date_str = str(date_str).split()[0].strip()
+        # Supported formats including 2-digit years
+        for fmt in ("%Y-%m-%d", "%d-%m-%Y", "%m/%d/%Y", "%d/%m/%Y", "%Y/%m/%d", "%d-%b-%Y", "%d-%b-%y", "%d-%m-%y", "%m/%d/%y", "%y-%m-%d"):
+            try:
+                return datetime.strptime(date_str, fmt)
+            except ValueError:
+                pass
+        try:
+            return pd.to_datetime(date_str).to_pydatetime()
+        except Exception:
+            return None
+
+    def format_input_date(self, date_str):
+        if not date_str:
+            return ""
+        parsed = self.parse_sheet_date(date_str)
+        if parsed:
+            return parsed.strftime("%Y-%m-%d")
+        return str(date_str).strip()
+
+    def refresh_db_view(self):
+        url = self.google_sheet_url.get().strip()
+        if not url:
+            return
+        self.log("Refreshing database view from Google Sheet...")
+        threading.Thread(target=self._refresh_db_view_worker, args=(url,), daemon=True).start()
+
+    def _refresh_db_view_worker(self, url):
+        try:
+            payload = {
+                "action": "fetch",
+                "token": self.security_token.get().strip()
+            }
+            headers = {"Content-Type": "application/json"}
+            response = requests.post(url, json=payload, headers=headers, timeout=20)
+            if response.status_code != 200:
+                raise ConnectionError(f"HTTP status {response.status_code}")
+                
+            res = response.json()
+            if not res.get("success"):
+                raise ValueError(res.get("error", "Unknown Error"))
+                
+            data_rows = res.get("data", [])
+            self.root.after(0, lambda: self._refresh_db_view_success(data_rows))
+        except Exception as e:
+            self.safe_log(f"Failed to refresh DB view: {e}")
+
+    def _refresh_db_view_success(self, data_rows):
+        for item_id in self.db_tree.get_children():
+            self.db_tree.delete(item_id)
+            
+        if not data_rows or len(data_rows) < 2:
+            return
+            
+        header = [str(h).strip().upper() for h in data_rows[0]]
+        
+        try:
+            lic_idx = header.index('LICNO/')
+            date_idx = header.index('LIC DATE')
+            port_idx = header.index('PORT OF REGISTRATION')
+            type_idx = header.index('LICENCE TYPE')
+            val_idx = header.index('VALUE')
+            exp_idx = header.index('EXPIRY DATE')
+            noboe_idx = header.index('COUNT OF JOB')
+            used_idx = header.index('USED VALUE')
+            bal_idx = header.index('BALANCE')
+            job_idx = header.index('JOB NO')
+        except ValueError as e:
+            self.log(f"Database sheet format error: missing column: {e}")
+            return
+            
+        for r in data_rows[1:]:
+            if len(r) <= max(lic_idx, bal_idx):
+                continue
+            
+            base_val = safe_float(r[val_idx])
+            used_val = safe_float(r[used_idx])
+            bal_val = safe_float(r[bal_idx])
+            
+            lic_no = str(r[lic_idx]).split('.')[0].strip()
+            
+            exp_val = r[exp_idx]
+            if isinstance(exp_val, str) and exp_val.strip() and exp_val.strip().lower() != 'nan':
+                exp_date = self.parse_sheet_date(exp_val)
+                exp_str = exp_date.strftime('%d-%b-%Y') if exp_date else exp_val
+            else:
+                exp_str = "N/A"
+                
+            lic_date_val = r[date_idx]
+            if isinstance(lic_date_val, str) and lic_date_val.strip() and lic_date_val.strip().lower() != 'nan':
+                lic_date = self.parse_sheet_date(lic_date_val)
+                lic_date_str = lic_date.strftime('%d-%b-%Y') if lic_date else lic_date_val
+            else:
+                lic_date_str = "N/A"
+                
+            self.db_tree.insert('', 'end', values=(
+                lic_no,
+                lic_date_str,
+                str(r[port_idx] or "").strip(),
+                str(r[type_idx] or "").strip(),
+                f"{base_val:.2f}",
+                exp_str,
+                str(r[noboe_idx] or 0),
+                f"{used_val:.2f}",
+                f"{bal_val:.2f}",
+                str(r[job_idx] or "").strip()
+            ))
+        self.log("Database view updated.")
+
+    def parse_pasted_text(self, text_content):
+        licenses = []
+        lines = text_content.strip().split('\n')
+        for line in lines:
+            if not line.strip():
+                continue
+            if '\t' in line:
+                parts = [p.strip() for p in line.split('\t')]
+            else:
+                parts = [p.strip() for p in re.split(r'\s{2,}', line)]
+                
+            if len(parts) >= 5:
+                lic_no = parts[0].strip()
+                date_str = self.format_input_date(parts[1].strip())
+                port = parts[2].strip()
+                lic_type = parts[3].strip()
+                val_str = parts[4].strip()
+                
+                raw_exp = parts[5].strip() if len(parts) > 5 else ""
+                if not raw_exp or raw_exp.lower() == 'nan':
+                    parsed_date = self.parse_sheet_date(date_str)
+                    if parsed_date:
+                        exp_date = parsed_date + timedelta(days=720)
+                        expiry_str = exp_date.strftime("%Y-%m-%d")
+                    else:
+                        expiry_str = ""
+                else:
+                    expiry_str = self.format_input_date(raw_exp)
+                
+                noboe_val = int(safe_float(parts[6].strip())) if len(parts) > 6 and parts[6].strip() else 0
+                used_val = safe_float(parts[7].strip()) if len(parts) > 7 and parts[7].strip() else 0.0
+                bal_val = safe_float(parts[8].strip()) if len(parts) > 8 and parts[8].strip() else safe_float(val_str)
+                job_no_val = parts[9].strip() if len(parts) > 9 else ""
+                
+                if lic_no and date_str and val_str:
+                    licenses.append({
+                        "lic_no": lic_no,
+                        "date": date_str,
+                        "port": port,
+                        "type": lic_type,
+                        "val": safe_float(val_str),
+                        "expiry": expiry_str,
+                        "noboe": noboe_val,
+                        "used_val": used_val,
+                        "balance": bal_val,
+                        "job_no": job_no_val
+                    })
+        return licenses
+
+    def parse_excel_licenses(self, file_path):
+        # Prioritize visible sheet named "Sheet1", fallback to first visible sheet
+        visible_sheet = 0
+        try:
+            wb = openpyxl.load_workbook(file_path, read_only=True)
+            found_sheet1 = False
+            for name in wb.sheetnames:
+                if name.strip().upper() == "SHEET1" and wb[name].sheet_state == 'visible':
+                    visible_sheet = name
+                    found_sheet1 = True
+                    break
+            if not found_sheet1:
+                for name in wb.sheetnames:
+                    if wb[name].sheet_state == 'visible':
+                        visible_sheet = name
+                        break
+            wb.close()
+        except Exception:
+            pass
+            
+        df = pd.read_excel(file_path, sheet_name=visible_sheet)
+        cols = [str(c).strip().upper() for c in df.columns]
+        
+        lic_col = -1
+        date_col = -1
+        port_col = -1
+        type_col = -1
+        val_col = -1
+        exp_col = -1
+        noboe_col = -1
+        used_col = -1
+        bal_col = -1
+        job_col = -1
+        
+        for idx, col in enumerate(cols):
+            col_str = str(col).strip().upper()
+            if 'LICNO' in col_str or 'LIC REF' in col_str or 'LICENSE NO' in col_str:
+                lic_col = idx
+            elif 'EXPIRY' in col_str:
+                exp_col = idx
+            elif 'LIC DATE' in col_str or ('DATE' in col_str and 'EXPIRY' not in col_str):
+                date_col = idx
+            elif 'PORT' in col_str:
+                port_col = idx
+            elif 'TYPE' in col_str:
+                type_col = idx
+            elif 'USED' in col_str:
+                used_col = idx
+            elif 'BAL' in col_str:
+                bal_col = idx
+            elif 'COUNT' in col_str or 'NO OF BOE' in col_str or 'BOE' in col_str:
+                noboe_col = idx
+            elif 'JOB' in col_str:
+                job_col = idx
+            elif 'VALUE' in col_str or 'VAL' in col_str:
+                val_col = idx
+                
+        if lic_col == -1: lic_col = 0
+        if date_col == -1: date_col = 1
+        if port_col == -1: port_col = 2
+        if type_col == -1: type_col = 3
+        if val_col == -1: val_col = 4
+        if exp_col == -1 and len(df.columns) > 5: exp_col = 5
+        
+        licenses = []
+        for idx, row in df.iterrows():
+            row_list = list(row)
+            if len(row_list) > max(lic_col, val_col) and not pd.isna(row_list[lic_col]):
+                lic_no = str(row_list[lic_col]).replace(".0", "").strip()
+                if not lic_no:
+                    continue
+                
+                raw_date = row_list[date_col]
+                if pd.isna(raw_date):
+                    date_str = ""
+                elif isinstance(raw_date, datetime):
+                    date_str = raw_date.strftime("%Y-%m-%d")
+                else:
+                    date_str = self.format_input_date(str(raw_date).split()[0])
+                    
+                raw_exp = row_list[exp_col] if exp_col != -1 and exp_col < len(row_list) else None
+                if pd.isna(raw_exp) or not str(raw_exp).strip():
+                    # Calculate LIC DATE + 720 days
+                    parsed_date = self.parse_sheet_date(date_str)
+                    if parsed_date:
+                        exp_date = parsed_date + timedelta(days=720)
+                        exp_str = exp_date.strftime("%Y-%m-%d")
+                    else:
+                        exp_str = ""
+                elif isinstance(raw_exp, datetime):
+                    exp_str = raw_exp.strftime("%Y-%m-%d")
+                else:
+                    exp_str = self.format_input_date(str(raw_exp).split()[0])
+                
+                # Parse additional historical columns if present in Excel
+                noboe_val = 0
+                if noboe_col != -1 and noboe_col < len(row_list):
+                    val_noboe = row_list[noboe_col]
+                    noboe_val = int(safe_float(val_noboe)) if not pd.isna(val_noboe) else 0
+                    
+                used_val = 0.0
+                if used_col != -1 and used_col < len(row_list):
+                    val_used = row_list[used_col]
+                    used_val = safe_float(val_used) if not pd.isna(val_used) else 0.0
+                    
+                bal_val = safe_float(row_list[val_col])
+                if bal_col != -1 and bal_col < len(row_list):
+                    val_bal = row_list[bal_col]
+                    bal_val = safe_float(val_bal) if not pd.isna(val_bal) else bal_val
+                    
+                job_no_val = ""
+                if job_col != -1 and job_col < len(row_list):
+                    val_job = row_list[job_col]
+                    job_no_val = str(val_job).strip() if not pd.isna(val_job) else ""
+                    if job_no_val.lower() == "nan":
+                        job_no_val = ""
+                
+                licenses.append({
+                    "lic_no": lic_no,
+                    "date": date_str,
+                    "port": str(row_list[port_col]).strip() if not pd.isna(row_list[port_col]) else "",
+                    "type": str(row_list[type_col]).strip() if not pd.isna(row_list[type_col]) else "",
+                    "val": safe_float(row_list[val_col]),
+                    "expiry": exp_str,
+                    "noboe": noboe_val,
+                    "used_val": used_val,
+                    "balance": bal_val,
+                    "job_no": job_no_val
+                })
+        return licenses
+
+    def push_pasted_licenses(self):
+        text = self.paste_txt.get("1.0", tk.END).strip()
+        if not text:
+            messagebox.showerror("Error", "Please paste license data first.")
+            return
+            
+        url = self.google_sheet_url.get().strip()
+        if not url:
+            messagebox.showerror("Error", "Google Web App URL is not configured.")
+            return
+            
+        try:
+            licenses = self.parse_pasted_text(text)
+            if not licenses:
+                messagebox.showerror("Error", "Could not parse any valid license rows. Please verify formatting.")
+                return
+                
+            self.paste_btn.config(state='disabled')
+            self.excel_btn.config(state='disabled')
+            self.root.config(cursor="watch")
+            
+            self.log(f"Pasting {len(licenses)} licenses to Google Sheets...")
+            threading.Thread(target=self._push_licenses_worker, args=(url, licenses, "paste"), daemon=True).start()
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to parse pasted data: {e}")
+
+    def push_excel_licenses(self):
+        path = self.new_lic_excel_path.get().strip()
+        if not path or not os.path.exists(path):
+            messagebox.showerror("Error", "Please select a valid Excel file.")
+            return
+            
+        url = self.google_sheet_url.get().strip()
+        if not url:
+            messagebox.showerror("Error", "Google Web App URL is not configured.")
+            return
+            
+        try:
+            licenses = self.parse_excel_licenses(path)
+            if not licenses:
+                messagebox.showerror("Error", "No license data found in the Excel sheet.")
+                return
+                
+            self.paste_btn.config(state='disabled')
+            self.excel_btn.config(state='disabled')
+            self.root.config(cursor="watch")
+            
+            self.log(f"Uploading {len(licenses)} licenses from Excel to Google Sheets...")
+            threading.Thread(target=self._push_licenses_worker, args=(url, licenses, "excel"), daemon=True).start()
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to parse Excel file: {e}")
+
+    def _push_licenses_worker(self, url, licenses_payload, source_type):
+        try:
+            payload = {
+                "action": "add_licenses",
+                "token": self.security_token.get().strip(),
+                "licenses": licenses_payload
+            }
+            headers = {"Content-Type": "application/json"}
+            response = requests.post(url, json=payload, headers=headers, timeout=30)
+            if response.status_code != 200:
+                raise ConnectionError(f"HTTP status {response.status_code}")
+                
+            res = response.json()
+            if not res.get("success"):
+                raise ValueError(res.get("error", "Unknown Error"))
+                
+            self.safe_log(f"Successfully pushed {len(licenses_payload)} licenses to Google Sheets.")
+            self.root.after(0, lambda: self._push_licenses_success(source_type))
+        except Exception as e:
+            self.safe_log(f"Failed to push licenses: {e}")
+            self.root.after(0, lambda: self._push_licenses_failure(str(e)))
+
+    def _push_licenses_success(self, source_type):
+        self.paste_btn.config(state='normal')
+        self.excel_btn.config(state='normal')
+        self.root.config(cursor="")
+        
+        if source_type == "paste":
+            self.paste_txt.delete("1.0", tk.END)
+        else:
+            self.new_lic_excel_path.set("")
+            
+        messagebox.showinfo("Success", "Licenses added successfully to the central cloud database!")
+        self.refresh_db_view()
+
+    def _push_licenses_failure(self, error_msg):
+        self.paste_btn.config(state='normal')
+        self.excel_btn.config(state='normal')
+        self.root.config(cursor="")
+        messagebox.showerror("Error", f"Failed to push licenses to cloud: {error_msg}")
 
     def on_tree_click(self, event):
         """Toggle checkbox status on treeview row click anywhere on the row."""
@@ -338,13 +895,11 @@ class LicenseAutomationApp:
             return
             
         values = list(self.lic_tree.item(item_id, 'values'))
-        # Toggle checkbox
         if values[0] == "☑":
             values[0] = "☐"
         else:
             values[0] = "☑"
             
-        # Dynamically manage checked and near_expiry tags to retain formatting
         current_tags = list(self.lic_tree.item(item_id, 'tags'))
         if values[0] == "☑":
             if 'checked' not in current_tags:
@@ -354,8 +909,6 @@ class LicenseAutomationApp:
                 current_tags.remove('checked')
                 
         self.lic_tree.item(item_id, values=values, tags=tuple(current_tags))
-        
-        # Recalculate summary metrics
         self.recalc_selected_duty_metrics()
 
     def recalc_selected_duty_metrics(self):
@@ -366,7 +919,7 @@ class LicenseAutomationApp:
             values = self.lic_tree.item(item_id, 'values')
             if values[0] == "☑":
                 try:
-                    bal_val = float(values[4])
+                    bal_val = safe_float(values[4])
                     self.selected_duty_covered += bal_val
                     selected_lics.append({
                         'lic_no': values[1],
@@ -375,18 +928,14 @@ class LicenseAutomationApp:
                 except ValueError:
                     pass
         
-        # Simulate allocation to get estimated debit amount
         self.estimated_debit, _ = self.simulate_debit(selected_lics)
-        
-        # Update summary UI
         self.update_summary_card()
 
     def simulate_debit(self, selected_lics):
-        """Simulate the greedy allocation to find the exact debit amount for each license."""
+        """Simulate the greedy allocation with "all-or-nothing" item coverage rule."""
         if not hasattr(self, 'item_duties') or not self.item_duties:
             return 0.0, {}
             
-        # Copy selected lics to avoid modifying state
         lics = [dict(l) for l in selected_lics]
         lic_ptr = 0
         license_debit_totals = {lic['lic_no']: 0.0 for lic in lics}
@@ -395,14 +944,21 @@ class LicenseAutomationApp:
             if duty <= 0.0:
                 continue
                 
+            # Check total available balance from current pointer onwards
+            total_avail = sum(max(0.0, lics[i]['bal'] - 1.00) for i in range(lic_ptr, len(lics)))
+            
+            # If we don't have enough total balance to cover this item's duty fully, skip it (pay cash)
+            if total_avail < duty:
+                continue
+                
+            # Otherwise, allocate fully
             duty_remaining = duty
             while duty_remaining > 0.005:
                 if lic_ptr >= len(lics):
                     break
                 curr_lic = lics[lic_ptr]
-                max_debitable = curr_lic['bal'] - 2.00
+                max_debitable = curr_lic['bal'] - 1.00
                 if max_debitable <= 0.01:
-                    # Skip this license as we cannot debit without leaving less than 2.00 balance
                     lic_ptr += 1
                     continue
                     
@@ -413,7 +969,7 @@ class LicenseAutomationApp:
                     duty_remaining = 0.0
                 else:
                     debit_amt = max_debitable
-                    curr_lic['bal'] = 2.00
+                    curr_lic['bal'] = 1.00
                     license_debit_totals[curr_lic['lic_no']] += debit_amt
                     duty_remaining -= debit_amt
                     lic_ptr += 1
@@ -425,49 +981,73 @@ class LicenseAutomationApp:
         """Parse files, extract job summary, load licenses, and update UI."""
         jd_path = self.job_data_path.get()
         ir_path = self.item_report_path.get()
-        sm_path = self.scrip_master_path.get()
         
-        if not (jd_path and ir_path and sm_path):
-            messagebox.showerror("Error", "Please configure all three Excel files first.")
+        if not (jd_path and ir_path):
+            messagebox.showerror("Error", "Please configure both JobData and Item Report Excel files first.")
             return
             
-        if not (os.path.exists(jd_path) and os.path.exists(ir_path) and os.path.exists(sm_path)):
+        if not (os.path.exists(jd_path) and os.path.exists(ir_path)):
             messagebox.showerror("Error", "One or more files do not exist at the specified paths.")
             return
 
-        self.log("Starting analysis of files...")
+        self.root.config(cursor="watch")
+        self.load_btn.config(state='disabled')
+        self.run_btn.config(state='disabled')
+        self.log("Starting analysis of files in background thread...")
         
+        scheme_dropdown_val = self.scheme_selection.get()
+        
+        threading.Thread(
+            target=self._load_and_analyze_worker,
+            args=(jd_path, ir_path, scheme_dropdown_val),
+            daemon=True
+        ).start()
+
+    def _load_and_analyze_worker(self, jd_path, ir_path, scheme_dropdown_val):
         try:
-            # 1. Parse Item Report for summary details
-            self.log("Reading Import Item Report...")
+            self.safe_log("Reading Import Item Report...")
             df_rep = pd.read_excel(ir_path)
             
-            # Identify columns
             cols = df_rep.columns.tolist()
-            req_cols = ['BE No', 'BE Date', 'Job No', 'Assessable Value (INR)', 'Basic Duty Rate', 'Exim Scheme Code', 'Quantity', 'Unit']
+            req_cols = ['BE No', 'BE Date', 'Job No', 'Assessable Value (INR)', 'Basic Duty Rate', 'Exim Scheme Code', 'Quantity', 'Unit', 'Product Desc']
             missing = [r for r in req_cols if r not in cols]
             if missing:
                 raise ValueError(f"Import Item Report is missing required column(s): {missing}")
             
-            # Compute total required basic duty
             df_rep['calc_duty'] = (df_rep['Assessable Value (INR)'] * df_rep['Basic Duty Rate'] / 100.0).round(2)
-            self.required_duty = round(df_rep['calc_duty'].sum(), 2)
-            self.item_duties = df_rep['calc_duty'].tolist()
+            required_duty = round(df_rep['calc_duty'].sum(), 2)
+            item_duties = df_rep['calc_duty'].tolist()
             
-            # Extract basic job details
-            be_no = str(df_rep.loc[0, 'BE No']).strip()
+            raw_be_no = df_rep.loc[0, 'BE No']
+            be_no = str(raw_be_no).strip() if not pd.isna(raw_be_no) else "nan"
+            
             be_date = df_rep.loc[0, 'BE Date']
-            if isinstance(be_date, datetime):
+            if pd.isna(be_date):
+                be_date_str = "nan"
+            elif isinstance(be_date, datetime):
                 be_date_str = be_date.strftime('%d-%b-%Y')
             else:
                 be_date_str = str(be_date).split()[0]
                 
             job_no = str(df_rep.loc[0, 'Job No']).strip()
-            scheme_code = str(df_rep.loc[0, 'Exim Scheme Code']).strip()
+            
+            raw_scheme_code = df_rep.loc[0, 'Exim Scheme Code']
+            if scheme_dropdown_val == "Auto-Detect":
+                if pd.isna(raw_scheme_code) or str(raw_scheme_code).strip().lower() in ('nan', ''):
+                    scheme_code = "RD"
+                    self.safe_log("Exim Scheme Code is empty in file. Defaulting to RD (RODTEP).")
+                else:
+                    scheme_code = str(raw_scheme_code).strip()
+            else:
+                if scheme_dropdown_val == "RODTEP":
+                    scheme_code = "RD"
+                else:
+                    scheme_code = scheme_dropdown_val
+                self.safe_log(f"Using manual License Scheme override: {scheme_dropdown_val}")
+                
             total_items = len(df_rep)
             
-            # 2. Extract port of registration from JobData GENERAL sheet
-            self.log("Reading JobData general details...")
+            self.safe_log("Reading JobData general details...")
             wb_jd = openpyxl.load_workbook(jd_path, read_only=True)
             if 'GENERAL' not in wb_jd.sheetnames:
                 raise ValueError("GENERAL sheet not found in JobData workbook.")
@@ -481,7 +1061,7 @@ class LicenseAutomationApp:
             import_port = str(rows_gen[1][port_col_idx]).strip()
             wb_jd.close()
             
-            self.job_info = {
+            job_info = {
                 'be_no': be_no,
                 'be_date': be_date,
                 'be_date_str': be_date_str,
@@ -491,16 +1071,33 @@ class LicenseAutomationApp:
                 'import_port': import_port
             }
             
-            self.log(f"Job Details: Job No: {job_no}, BE No: {be_no}, Import Port: {import_port}, Scheme: {scheme_code}")
-            self.log(f"Total Checklist Items: {total_items}, Required License Duty: {self.required_duty:,.2f} INR")
-
-            # 3. Load Licenses from Scrip Master Data 14072021
-            self.log("Loading active licenses from Scrip Master...")
-            wb_scrip = openpyxl.load_workbook(sm_path, read_only=True, data_only=True)
-            if 'Data 14072021' not in wb_scrip.sheetnames:
-                raise ValueError("Sheet 'Data 14072021' not found in Scrip Master.")
-            ws_scrip = wb_scrip['Data 14072021']
-            scrip_rows = list(ws_scrip.iter_rows(values_only=True))
+            self.safe_log(f"Job Details: Job No: {job_no}, BE No: {be_no}, Import Port: {import_port}, Scheme: {scheme_code}")
+            self.safe_log(f"Total Checklist Items: {total_items}, Required License Duty: {required_duty:,.2f} INR")
+            
+            # Load active licenses from Google Sheet API
+            url = self.google_sheet_url.get().strip()
+            if not url:
+                raise ValueError("Google Web App URL is not configured. Please set it in the Database Master tab.")
+                
+            self.safe_log("Loading active licenses from Google Sheets cloud...")
+            headers = {"Content-Type": "application/json"}
+            payload = {
+                "action": "fetch",
+                "token": self.security_token.get().strip()
+            }
+            response = requests.post(url, json=payload, headers=headers, timeout=30)
+            if response.status_code != 200:
+                raise ConnectionError(f"Cloud request failed with status: {response.status_code}")
+                
+            res_data = response.json()
+            if not res_data.get("success"):
+                raise ValueError(f"Cloud DB returned error: {res_data.get('error', 'Unknown Error')}")
+                
+            scrip_rows = res_data.get("data", [])
+            if not scrip_rows or len(scrip_rows) < 2:
+                self.safe_log("Warning: No license records found in the cloud database.")
+                scrip_rows = []
+                
             header_scrip = [str(h).strip().upper() for h in scrip_rows[0]]
             
             lic_idx = header_scrip.index('LICNO/')
@@ -513,40 +1110,28 @@ class LicenseAutomationApp:
             
             mapped_lic_type = "RODTEP" if scheme_code.upper() == "RD" else scheme_code.upper()
             
-            self.active_licenses = []
+            active_licenses = []
             for idx, r in enumerate(scrip_rows[1:], start=2):
                 if len(r) <= max(lic_idx, bal_idx, port_idx, type_idx, exp_idx) or r[lic_idx] is None:
                     continue
                 lic_type = str(r[type_idx]).strip().upper() if r[type_idx] is not None else ""
                 
-                # Filter by scheme type
                 if mapped_lic_type in lic_type:
                     bal = r[bal_idx]
                     if bal is not None:
                         try:
-                            bal_f = float(bal)
+                            bal_f = safe_float(bal)
                             if bal_f > 0.00:
                                 exp_val = r[exp_idx]
-                                if isinstance(exp_val, str):
-                                    exp_date = datetime.strptime(exp_val.split()[0], "%Y-%m-%d")
-                                elif isinstance(exp_val, datetime):
-                                    exp_date = exp_val
-                                else:
-                                    exp_date = None
-                                    
+                                exp_date = self.parse_sheet_date(exp_val)
                                 reg_date_val = r[date_idx]
-                                if isinstance(reg_date_val, str):
-                                    reg_date = datetime.strptime(reg_date_val.split()[0], "%Y-%m-%d")
-                                elif isinstance(reg_date_val, datetime):
-                                    reg_date = reg_date_val
-                                else:
-                                    reg_date = None
-                                    
-                                self.active_licenses.append({
+                                reg_date = self.parse_sheet_date(reg_date_val)
+                                
+                                active_licenses.append({
                                     'lic_no': str(r[lic_idx]).split('.')[0].strip(),
                                     'port': str(r[port_idx]).strip(),
                                     'type': str(r[type_idx]).strip(),
-                                    'val': float(r[val_idx]) if r[val_idx] is not None else 0.0,
+                                    'val': safe_float(r[val_idx]),
                                     'bal': bal_f,
                                     'expiry': exp_date,
                                     'reg_date': reg_date
@@ -554,44 +1139,60 @@ class LicenseAutomationApp:
                         except ValueError:
                             pass
             
-            wb_scrip.close()
-            
-            # Keep original order from Excel sheet (no sorting)
-            
-            self.log(f"Successfully loaded {len(self.active_licenses)} active {mapped_lic_type} licenses.")
-            
-            # Populate table
-            self.populate_license_table()
-            
-            # Recalculate summary metrics
-            self.recalc_selected_duty_metrics()
-            
-            # Enable execute button
-            self.run_btn.config(state='normal')
+            self.safe_log(f"Successfully loaded {len(active_licenses)} active {mapped_lic_type} licenses.")
+            self.root.after(0, lambda: self._load_and_analyze_success(job_info, active_licenses, required_duty, item_duties))
             
         except Exception as e:
-            self.log(f"Error during analysis: {e}")
-            messagebox.showerror("Error", f"Failed to analyze files: {e}")
+            self.root.after(0, lambda: self._load_and_analyze_failure(str(e)))
+
+    def _load_and_analyze_success(self, job_info, active_licenses, required_duty, item_duties):
+        self.job_info = job_info
+        self.active_licenses = active_licenses
+        self.required_duty = required_duty
+        self.item_duties = item_duties
+        
+        self.populate_license_table()
+        self.recalc_selected_duty_metrics()
+        
+        self.root.config(cursor="")
+        self.load_btn.config(state='normal')
+        self.run_btn.config(state='normal')
+        self.log("Analysis completed successfully.")
+
+    def _load_and_analyze_failure(self, error_msg):
+        self.root.config(cursor="")
+        self.load_btn.config(state='normal')
+        self.run_btn.config(state='disabled')
+        self.log(f"Error during analysis: {error_msg}")
+        messagebox.showerror("Error", f"Failed to analyze files: {error_msg}")
 
     def populate_license_table(self):
-        """Fill treeview table and auto-check the licenses needed in their Excel order."""
-        # Clear existing
+        """Fill treeview table and auto-check the licenses that will actually be utilized, placing them at the top."""
         for item_id in self.lic_tree.get_children():
             self.lic_tree.delete(item_id)
             
-        cumulative_bal = 0.0
-        for i, item in enumerate(self.active_licenses):
-            exp_str = item['expiry'].strftime('%d-%b-%Y') if item['expiry'] is not None else "N/A"
-            
-            # Greedy auto-selection based on order in table covering required duty.
-            # We skip licenses with balance < 100.00 INR by default to avoid cluttering with tiny residual balances.
-            if item['bal'] >= 100.00 and cumulative_bal < self.required_duty:
-                selected_str = "☑"
-                cumulative_bal += item['bal']
+        # Run simulation to see which licenses are actually used
+        candidate_lics = [item for item in self.active_licenses if item['bal'] >= 3.00]
+        _, debit_totals = self.simulate_debit(candidate_lics)
+        
+        selected_items = []
+        unselected_items = []
+        
+        for item in self.active_licenses:
+            is_used = (debit_totals.get(item['lic_no'], 0.0) > 0.0)
+            item['auto_selected'] = is_used
+            if is_used:
+                selected_items.append(item)
             else:
-                selected_str = "☐"
+                unselected_items.append(item)
                 
-            # Expiry is near (within 30 days) and base value > 500
+        # Combine lists with selected ones at the top
+        ordered_licenses = selected_items + unselected_items
+        
+        for item in ordered_licenses:
+            exp_str = item['expiry'].strftime('%d-%b-%Y') if item['expiry'] is not None else "N/A"
+            selected_str = "☑" if item['auto_selected'] else "☐"
+            
             is_near = False
             if item['expiry'] is not None:
                 days_to_expiry = (item['expiry'] - datetime.now()).days
@@ -615,27 +1216,35 @@ class LicenseAutomationApp:
 
     def update_summary_card(self):
         """Update left summary panel with calculated details and shortfall indicators."""
-        # Clear summary
         for widget in self.summary_text_frame.winfo_children():
             widget.destroy()
             
         if not self.job_info:
             return
             
-        # Add labels
         grid_params = {'anchor': 'w', 'pady': 3}
         
+        be_no_val = self.job_info['be_no'] if str(self.job_info['be_no']).lower() != 'nan' else "Pending / Empty"
+        be_date_val = self.job_info['be_date_str'] if str(self.job_info['be_date_str']).lower() != 'nan' else "Pending / Empty"
+        
+        scheme_val = self.job_info['scheme'].upper()
+        if scheme_val == "RD":
+            scheme_display = "RODTEP"
+        elif scheme_val == "NAN":
+            scheme_display = "Pending / Empty"
+        else:
+            scheme_display = scheme_val
+            
         ttk.Label(self.summary_text_frame, text=f"Job Number: {self.job_info['job_no']}", style='Summary.TLabel').pack(**grid_params)
-        ttk.Label(self.summary_text_frame, text=f"Bill of Entry No: {self.job_info['be_no']}", style='Summary.TLabel').pack(**grid_params)
-        ttk.Label(self.summary_text_frame, text=f"Bill of Entry Date: {self.job_info['be_date_str']}", style='Summary.TLabel').pack(**grid_params)
+        ttk.Label(self.summary_text_frame, text=f"Bill of Entry No: {be_no_val}", style='Summary.TLabel').pack(**grid_params)
+        ttk.Label(self.summary_text_frame, text=f"Bill of Entry Date: {be_date_val}", style='Summary.TLabel').pack(**grid_params)
         ttk.Label(self.summary_text_frame, text=f"Import Port: {self.job_info['import_port']}", style='Summary.TLabel').pack(**grid_params)
-        ttk.Label(self.summary_text_frame, text=f"Required License Type: {self.job_info['scheme'].upper()} (RODTEP)", style='Summary.TLabel').pack(**grid_params)
+        ttk.Label(self.summary_text_frame, text=f"Required License Type: {scheme_display}", style='Summary.TLabel').pack(**grid_params)
         ttk.Label(self.summary_text_frame, text=f"Total Items in Checklist: {self.job_info['total_items']}", style='Summary.TLabel').pack(**grid_params)
         
         separator = ttk.Separator(self.summary_text_frame, orient='horizontal')
         separator.pack(fill='x', pady=10)
         
-        # Simplified user-friendly labels
         cash_payment = max(0.0, self.required_duty - self.estimated_debit)
         
         ttk.Label(self.summary_text_frame, text=f"Total Duty to Pay: {self.required_duty:,.2f} INR", font=(FONT_FAMILY, 10, 'bold')).pack(**grid_params)
@@ -643,7 +1252,6 @@ class LicenseAutomationApp:
         ttk.Label(self.summary_text_frame, text=f"Duty Covered by License (Exemption): {self.estimated_debit:,.2f} INR", font=(FONT_FAMILY, 10, 'bold')).pack(**grid_params)
         ttk.Label(self.summary_text_frame, text=f"Remaining Duty to Pay in Cash: {cash_payment:,.2f} INR", font=(FONT_FAMILY, 10, 'bold')).pack(**grid_params)
         
-        # Check shortfall based on estimated debit
         if cash_payment <= 0.02:
             status_text = "Status: Fully Covered (No cash payment required)"
             status_color = COLOR_ACCENT
@@ -654,12 +1262,10 @@ class LicenseAutomationApp:
         ttk.Label(self.summary_text_frame, text=status_text, foreground=status_color, font=(FONT_FAMILY, 11, 'bold')).pack(**grid_params)
 
     def run_license_automation(self):
-        """Execute license allocation, modify JobData, modify Scrip Master, and notify user."""
+        """Execute license allocation, modify JobData, modify central database, and notify user."""
         jd_path = self.job_data_path.get()
         ir_path = self.item_report_path.get()
-        sm_path = self.scrip_master_path.get()
         
-        # Get selected license numbers from treeview
         selected_lic_nos = []
         for item_id in self.lic_tree.get_children():
             values = self.lic_tree.item(item_id, 'values')
@@ -675,11 +1281,20 @@ class LicenseAutomationApp:
             ans = messagebox.askyesno("Warning", f"The selected licenses do not cover the total required duty. You will need to pay {cash_needed:,.2f} INR in cash to customs. Do you want to proceed?")
             if not ans:
                 return
-
-        self.log("Initiating license debiting process...")
+  
+        self.root.config(cursor="watch")
+        self.load_btn.config(state='disabled')
+        self.run_btn.config(state='disabled')
+        self.log("Initiating license debiting process in background thread...")
         
+        threading.Thread(
+            target=self._run_license_automation_worker,
+            args=(jd_path, ir_path, selected_lic_nos),
+            daemon=True
+        ).start()
+
+    def _run_license_automation_worker(self, jd_path, ir_path, selected_lic_nos):
         try:
-            # 1. Build selected licenses list (pull matching references from self.active_licenses)
             selected_lics = []
             for lic_no in selected_lic_nos:
                 for item in self.active_licenses:
@@ -687,11 +1302,10 @@ class LicenseAutomationApp:
                         selected_lics.append(dict(item))
                         break
             
-            # 2. Read Item Report
+            self.safe_log("Reading Import Item Report...")
             df_rep = pd.read_excel(ir_path)
             
-            # 3. Read JobData ITEMS to establish correct serial indexes
-            self.log("Opening JobData Excel for writing (preserving formulas)...")
+            self.safe_log("Opening JobData Excel for writing (preserving formulas)...")
             wb_jd = openpyxl.load_workbook(jd_path, data_only=False)
             ws_inv = wb_jd['INVOICES']
             inv_rows = list(ws_inv.iter_rows(values_only=True))
@@ -713,8 +1327,7 @@ class LicenseAutomationApp:
             qty_idx = items_header.index('QTY')
             cth_idx = items_header.index('CTH')
             
-            # 4. Perform Greedy Allocation Row-by-Row
-            self.log("Running allocation algorithm...")
+            self.safe_log("Running allocation algorithm...")
             lic_ptr = 0
             job_license_rows = []
             license_debit_totals = {lic['lic_no']: 0.0 for lic in selected_lics}
@@ -722,13 +1335,12 @@ class LicenseAutomationApp:
             for idx, r_row in df_rep.iterrows():
                 rep_inv_no = str(r_row['Invoice No']).strip()
                 rep_desc = str(r_row['Product Desc']).strip()
-                rep_qty = float(r_row['Quantity'])
+                rep_qty = safe_float(r_row['Quantity'])
                 rep_cth = str(r_row['CTH']).strip()
                 
-                av = float(r_row['Assessable Value (INR)'])
-                rate = float(r_row['Basic Duty Rate'])
+                av = safe_float(r_row['Assessable Value (INR)'])
+                rate = safe_float(r_row['Basic Duty Rate'])
                 
-                # Match item in JobData ITEMS sheet to get InvSrNo and ItemSrNo
                 inv_sr = inv_map.get(rep_inv_no)
                 item_sr = None
                 
@@ -738,31 +1350,26 @@ class LicenseAutomationApp:
                             itm_inv_sr = str(item_row[item_inv_sr_idx]).strip()
                             if itm_inv_sr == inv_sr:
                                 itm_desc = str(item_row[desc_idx]).strip() if item_row[desc_idx] is not None else ""
-                                itm_qty = float(item_row[qty_idx]) if item_row[qty_idx] is not None else 0.0
+                                itm_qty = safe_float(item_row[qty_idx])
                                 itm_cth = str(item_row[cth_idx]).strip() if item_row[cth_idx] is not None else ""
                                 
-                                # Match criteria
                                 if itm_desc == rep_desc and abs(itm_qty - rep_qty) < 0.01 and itm_cth == rep_cth:
                                     item_sr = str(item_row[item_sr_idx]).strip()
                                     break
                 
                 if not item_sr:
-                    self.log(f"Warning: Could not match item row {idx} (Desc: {rep_desc[:30]}...) to ITEMS sheet. Skipping.")
+                    self.safe_log(f"Warning: Could not match item row {idx} (Desc: {rep_desc[:30]}...) to ITEMS sheet. Skipping.")
                     continue
                 
-                # Calculate required duty (round to 2 decimals)
                 duty = round(av * rate / 100.0, 2)
                 
-                # Allocate duty
-                duty_remaining = duty
-                
-                # Edge case: 0 duty items still need mapping to the current license!
                 if duty == 0.0:
                     if lic_ptr < len(selected_lics):
                         curr_lic = selected_lics[lic_ptr]
                         job_license_rows.append({
                             'Inv_SrNo': inv_sr,
                             'Item_SrNo': item_sr,
+                            'Invoice_No': rep_inv_no,
                             'License_No': curr_lic['lic_no'],
                             'License_Date': curr_lic['reg_date'].strftime('%d-%b-%Y') if curr_lic['reg_date'] else "",
                             'License_RegNo': curr_lic['lic_no'],
@@ -771,78 +1378,94 @@ class LicenseAutomationApp:
                             'CIF_Value': av,
                             'DebitDeutyValue': 0.00,
                             'DebitQuantity': rep_qty,
-                            'DebitQuantityUnitCode': r_row['Unit']
+                            'DebitQuantityUnitCode': r_row['Unit'],
+                            'Product_Desc': rep_desc,
+                            'Assessable_Value': av,
+                            'Basic_Duty_Rate': rate,
+                            'Basic_Duty_Value': 0.00
                         })
                     continue
 
+                # Check total available balance of all selected licenses starting from current pointer
+                total_avail = sum(max(0.0, selected_lics[i]['bal'] - 1.00) for i in range(lic_ptr, len(selected_lics)))
+                
+                # If we don't have enough total balance to cover this item's duty fully, skip it (pay cash)
+                if total_avail < duty:
+                    self.safe_log(f"Skipping item {idx+1} (Duty: {duty:.2f} INR) - Insufficient remaining license balance to cover it fully to 0.")
+                    continue
+
+                duty_remaining = duty
                 while duty_remaining > 0:
                     if lic_ptr >= len(selected_lics):
-                        self.log(f"Warning: Insufficient license balance. Item {idx+1} (Duty: {duty_remaining:.2f}) left uncovered.")
                         break
                         
                     curr_lic = selected_lics[lic_ptr]
-                    max_debitable = curr_lic['bal'] - 2.00
+                    max_debitable = curr_lic['bal'] - 1.00
                     if max_debitable <= 0.01:
-                        # Move to next license as this one cannot be debited without falling below 2.00 INR balance
                         lic_ptr += 1
                         if lic_ptr < len(selected_lics):
-                            self.log(f"License depleted or insufficient (below 2.00 balance). Switching to License: {selected_lics[lic_ptr]['lic_no']}")
+                            self.safe_log(f"License depleted or insufficient (below 1.00 balance). Switching to License: {selected_lics[lic_ptr]['lic_no']}")
                         continue
                         
                     if max_debitable >= duty_remaining:
-                        # Full debit from the license
                         debit_amt = duty_remaining
                         curr_lic['bal'] -= debit_amt
                         ratio = debit_amt / duty
                         job_license_rows.append({
                             'Inv_SrNo': inv_sr,
                             'Item_SrNo': item_sr,
+                            'Invoice_No': rep_inv_no,
                             'License_No': curr_lic['lic_no'],
                             'License_Date': curr_lic['reg_date'].strftime('%d-%b-%Y') if curr_lic['reg_date'] else "",
                             'License_RegNo': curr_lic['lic_no'],
                             'License_RegDate': curr_lic['reg_date'].strftime('%d-%b-%Y') if curr_lic['reg_date'] else "",
                             'Reg_Port': curr_lic['port'],
-                            'CIF_Value': round(av * ratio, 2),
+                            'CIF_Value': av,
                             'DebitDeutyValue': round(debit_amt, 2),
                             'DebitQuantity': round(rep_qty * ratio, 3),
-                            'DebitQuantityUnitCode': r_row['Unit']
+                            'DebitQuantityUnitCode': r_row['Unit'],
+                            'Product_Desc': rep_desc,
+                            'Assessable_Value': av,
+                            'Basic_Duty_Rate': rate,
+                            'Basic_Duty_Value': duty
                         })
                         license_debit_totals[curr_lic['lic_no']] += debit_amt
                         duty_remaining = 0
                     else:
-                        # Debit up to max_debitable
                         debit_amt = max_debitable
-                        curr_lic['bal'] = 2.00
+                        curr_lic['bal'] = 1.00
                         ratio = debit_amt / duty
                         job_license_rows.append({
                             'Inv_SrNo': inv_sr,
                             'Item_SrNo': item_sr,
+                            'Invoice_No': rep_inv_no,
                             'License_No': curr_lic['lic_no'],
                             'License_Date': curr_lic['reg_date'].strftime('%d-%b-%Y') if curr_lic['reg_date'] else "",
                             'License_RegNo': curr_lic['lic_no'],
                             'License_RegDate': curr_lic['reg_date'].strftime('%d-%b-%Y') if curr_lic['reg_date'] else "",
                             'Reg_Port': curr_lic['port'],
-                            'CIF_Value': round(av * ratio, 2),
+                            'CIF_Value': av,
                             'DebitDeutyValue': round(debit_amt, 2),
                             'DebitQuantity': round(rep_qty * ratio, 3),
-                            'DebitQuantityUnitCode': r_row['Unit']
+                            'DebitQuantityUnitCode': r_row['Unit'],
+                            'Product_Desc': rep_desc,
+                            'Assessable_Value': av,
+                            'Basic_Duty_Rate': rate,
+                            'Basic_Duty_Value': duty
                         })
                         license_debit_totals[curr_lic['lic_no']] += debit_amt
                         duty_remaining -= debit_amt
                         
-                        # Move to next license
                         lic_ptr += 1
                         if lic_ptr < len(selected_lics):
-                            self.log(f"License depleted (left with exactly 2.00 balance). Switching to License: {selected_lics[lic_ptr]['lic_no']}")
+                            self.safe_log(f"License depleted (left with exactly 1.00 balance). Switching to License: {selected_lics[lic_ptr]['lic_no']}")
 
-            # 5. Populate JobData LICENSE Sheet
-            self.log("Writing to JobData LICENSE sheet...")
+            self.safe_log("Writing to JobData LICENSE sheet...")
             if 'LICENSE' not in wb_jd.sheetnames:
                 ws_lic = wb_jd.create_sheet('LICENSE')
             else:
                 ws_lic = wb_jd['LICENSE']
                 
-            # Clear existing data except header
             ws_lic.delete_rows(2, ws_lic.max_row)
             
             headers = [
@@ -853,7 +1476,6 @@ class LicenseAutomationApp:
             for col_num, header in enumerate(headers, 1):
                 ws_lic.cell(row=1, column=col_num, value=header)
                 
-            # Write allocations
             for row_idx, data in enumerate(job_license_rows, start=2):
                 ws_lic.cell(row=row_idx, column=1, value=data['Inv_SrNo'])
                 ws_lic.cell(row=row_idx, column=2, value=data['Item_SrNo'])
@@ -869,215 +1491,68 @@ class LicenseAutomationApp:
                 ws_lic.cell(row=row_idx, column=12, value=data['DebitQuantity'])
                 ws_lic.cell(row=row_idx, column=13, value=data['DebitQuantityUnitCode'])
             
-            # Save updated JobData
             dir_name = os.path.dirname(jd_path)
             date_stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            # Sanitize job number to prevent slash directory errors
             clean_job_no_str = re.sub(r'[\\/*?:"<>|]', '_', self.job_info['job_no'])
             job_name = f"JobData_{clean_job_no_str}_Processed_{date_stamp}.xlsx"
             output_jd_path = os.path.join(dir_name, job_name)
             
-            self.log("Saving processed JobData Excel...")
+            self.safe_log("Saving processed JobData Excel...")
             wb_jd.save(output_jd_path)
             wb_jd.close()
-            self.log(f"JobData saved successfully to: {os.path.basename(output_jd_path)}")
+            self.safe_log(f"JobData saved successfully to: {os.path.basename(output_jd_path)}")
 
-            # 6. Update Scrip Master BOE sheet
-            self.log("Opening Scrip Master for writing (preserving formulas)...")
-            wb_sm = openpyxl.load_workbook(sm_path, data_only=False)
-            if 'BOE' not in wb_sm.sheetnames:
-                ws_boe = wb_sm.create_sheet('BOE')
-                ws_boe.append(['LICNO.', 'VALUE', 'BOENO', 'BOE DATE', 'Job No', 'Column1'])
-            else:
-                ws_boe = wb_sm['BOE']
+            # 6. Push Debits to Google Sheets cloud
+            self.safe_log("Preparing debit data to push to Google Sheets cloud...")
+            debits_payload = []
             
-            clean_job_no = None
-            try:
-                job_match = re.search(r'/(\d+)/', self.job_info['job_no'])
-                if job_match:
-                    clean_job_no = int(job_match.group(1))
-                else:
-                    digits = ''.join(c for c in self.job_info['job_no'] if c.isdigit())
-                    clean_job_no = int(digits) if digits else 0
-            except Exception:
-                clean_job_no = 0
+            for data in job_license_rows:
+                debits_payload.append({
+                    "lic_no": data['License_No'],
+                    "val": data['DebitDeutyValue'],
+                    "job_no": self.job_info['job_no'],
+                    "inv_no": data['Invoice_No'],
+                    "desc": data['Product_Desc'],
+                    "av": data['CIF_Value'],
+                    "rate": data['Basic_Duty_Rate'],
+                    "duty_val": data['Basic_Duty_Value']
+                })
                 
-            clean_be_no = int(self.job_info['be_no']) if self.job_info['be_no'].isdigit() else 0
-            
-            be_date_val = self.job_info['be_date']
-            if isinstance(be_date_val, str):
-                try:
-                    be_date_val = datetime.strptime(be_date_val.split()[0], "%Y-%m-%d")
-                except Exception:
-                    pass
-
-            for lic_no, val in license_debit_totals.items():
-                if val > 0.01:
-                    new_row = [
-                        int(lic_no) if lic_no.isdigit() else lic_no,
-                        round(val, 2),
-                        clean_be_no,
-                        be_date_val,
-                        clean_job_no,
-                        None
-                    ]
-                    ws_boe.append(new_row)
-                    self.log(f"Appended debit of {val:,.2f} INR to BOE for License {lic_no}")
-            
-            # Recalculate calculations for licenses
-            self.log("Recalculating Scrip Master formula values...")
-            recalculate_scrip_master_formulas(wb_sm)
-            
-            self.log("Saving updated Scrip Master Excel...")
-            wb_sm.save(sm_path)
-            wb_sm.close()
-            self.log("Scrip Master saved and updated successfully.")
-
-            # Show Success Dialog
-            messagebox.showinfo("Success", f"License automation finished successfully!\n\n1. JobData updated and saved to:\n{os.path.basename(output_jd_path)}\n\n2. Scrip Master updated in-place.")
-            
-            # Reload everything to refresh the balance list
-            self.load_and_analyze_data()
+            self.safe_log("Pushing debits to Google Sheets cloud...")
+            url = self.google_sheet_url.get().strip()
+            payload = {
+                "action": "debit",
+                "token": self.security_token.get().strip(),
+                "debits": debits_payload
+            }
+            response = requests.post(url, json=payload, headers={"Content-Type": "application/json"}, timeout=30)
+            if response.status_code != 200:
+                raise ConnectionError(f"Cloud update request failed with status: {response.status_code}")
+                
+            res_data = response.json()
+            if not res_data.get("success"):
+                raise ValueError(res_data.get("error", "Unknown Error"))
+                
+            self.safe_log("Google Sheets updated successfully.")
+            self.root.after(0, lambda: self._run_license_automation_success(output_jd_path))
             
         except Exception as e:
-            self.log(f"Error executing license allocation: {e}")
-            messagebox.showerror("Error", f"Failed to complete license allocation: {e}")
+            self.root.after(0, lambda: self._run_license_automation_failure(str(e)))
 
+    def _run_license_automation_success(self, output_jd_path):
+        self.root.config(cursor="")
+        self.load_btn.config(state='normal')
+        self.run_btn.config(state='normal')
+        
+        messagebox.showinfo("Success", f"License automation finished successfully!\n\n1. JobData updated and saved to:\n{os.path.basename(output_jd_path)}\n\n2. Google Sheets updated successfully in cloud.")
+        self.load_and_analyze_data()
 
-def recalculate_scrip_master_formulas(wb):
-    """Recalculate formulas in Data 14072021 based on BOE sheet entries and store in CACHED_VALUES."""
-    if 'BOE' not in wb.sheetnames or 'Data 14072021' not in wb.sheetnames:
-        return
-        
-    ws_boe = wb['BOE']
-    boe_rows = list(ws_boe.iter_rows(values_only=True))
-    if not boe_rows or len(boe_rows) < 2:
-        boe_rows = [ ['LICNO.', 'VALUE', 'BOENO', 'BOE DATE', 'Job No'] ]
-        
-    header_boe = [str(h).strip().upper() for h in boe_rows[0]]
-    
-    lic_col = -1
-    val_col = -1
-    boeno_col = -1
-    jobno_col = -1
-    
-    for idx, col in enumerate(header_boe):
-        col_str = str(col).strip().upper()
-        if 'LIC' in col_str:
-            lic_col = idx
-        elif 'VAL' in col_str:
-            val_col = idx
-        elif 'BOENO' in col_str or 'BOE NO' in col_str:
-            boeno_col = idx
-        elif 'JOB' in col_str:
-            jobno_col = idx
-            
-    if lic_col == -1: lic_col = 0
-    if val_col == -1: val_col = 1
-    if boeno_col == -1: boeno_col = 2
-    if jobno_col == -1: jobno_col = 4
-    
-    from collections import defaultdict
-    used_map = defaultdict(float)
-    boe_sum_map = defaultdict(float)
-    job_sum_map = defaultdict(float)
-    
-    for row in boe_rows[1:]:
-        if len(row) > max(lic_col, val_col) and row[lic_col] is not None:
-            lic_str = str(row[lic_col]).replace(".0", "").strip()
-            
-            # Value
-            val = float(row[val_col]) if val_col < len(row) and row[val_col] is not None else 0.0
-            used_map[lic_str] += val
-            
-            # BOE No
-            if boeno_col < len(row) and row[boeno_col] is not None:
-                try:
-                    boe_sum_map[lic_str] += float(row[boeno_col])
-                except ValueError:
-                    pass
-                    
-            # Job No
-            if jobno_col < len(row) and row[jobno_col] is not None:
-                try:
-                    job_sum_map[lic_str] += float(row[jobno_col])
-                except ValueError:
-                    pass
-                    
-    # 2. Recalculate Data 14072021 sheet
-    ws_data = wb['Data 14072021']
-    data_rows = list(ws_data.iter_rows(values_only=True))
-    if not data_rows:
-        return
-        
-    header_scrip = [str(h).strip().upper() for h in data_rows[0]]
-    lic_idx = header_scrip.index('LICNO/')
-    val_idx = header_scrip.index('VALUE')
-    date_idx = header_scrip.index('LIC DATE')
-    
-    # Locate other formula columns
-    exp_col_letter = 'G'
-    noboe_col_letter = 'H'
-    used_col_letter = 'I'
-    bal_col_letter = 'J'
-    job_col_letter = 'K'
-    
-    for col_idx, h in enumerate(header_scrip, start=1):
-        h_str = str(h).strip().upper()
-        col_letter = openpyxl.utils.get_column_letter(col_idx)
-        if 'EXPIRY' in h_str:
-            exp_col_letter = col_letter
-        elif 'NO OF BOE' in h_str:
-            noboe_col_letter = col_letter
-        elif 'USED VALUE' in h_str or 'USED_VALUE' in h_str:
-            used_col_letter = col_letter
-        elif 'BALANCE' in h_str:
-            bal_col_letter = col_letter
-        elif 'JOB NO' in h_str or 'JOB_NO' in h_str:
-            job_col_letter = col_letter
-            
-    global CACHED_VALUES
-    CACHED_VALUES.clear()
-    
-    for row_idx, row in enumerate(data_rows[1:], start=2):
-        if len(row) > lic_idx and row[lic_idx] is not None:
-            lic_str = str(row[lic_idx]).replace(".0", "").strip()
-            
-            # Base value
-            base_val = float(row[val_idx]) if val_idx < len(row) and row[val_idx] is not None else 0.0
-            
-            # Recalculated values
-            used_val = round(used_map[lic_str], 2)
-            no_boe = round(boe_sum_map[lic_str], 2)
-            job_no_sum = round(job_sum_map[lic_str], 2)
-            bal_val = round(base_val - used_val, 2)
-            
-            # Expiry date (LIC DATE + 720 days)
-            exp_val = None
-            lic_date_val = row[date_idx]
-            if lic_date_val is not None:
-                if isinstance(lic_date_val, datetime):
-                    exp_val = lic_date_val + timedelta(days=720)
-                elif isinstance(lic_date_val, str):
-                    try:
-                        dt = datetime.strptime(lic_date_val.split()[0], "%Y-%m-%d")
-                        exp_val = dt + timedelta(days=720)
-                    except Exception:
-                        pass
-                        
-            if exp_val is not None:
-                exp_val_str = exp_val.strftime("%Y-%m-%d %H:%M:%S")
-            else:
-                exp_val_str = None
-                
-            # Add to CACHED_VALUES registry
-            sheet_title = ws_data.title
-            CACHED_VALUES[(sheet_title, f"{exp_col_letter}{row_idx}")] = exp_val_str
-            CACHED_VALUES[(sheet_title, f"{noboe_col_letter}{row_idx}")] = no_boe
-            CACHED_VALUES[(sheet_title, f"{used_col_letter}{row_idx}")] = used_val
-            CACHED_VALUES[(sheet_title, f"{bal_col_letter}{row_idx}")] = bal_val
-            CACHED_VALUES[(sheet_title, f"{job_col_letter}{row_idx}")] = job_no_sum
-
+    def _run_license_automation_failure(self, error_msg):
+        self.root.config(cursor="")
+        self.load_btn.config(state='normal')
+        self.run_btn.config(state='normal')
+        self.log(f"Error executing license allocation: {error_msg}")
+        messagebox.showerror("Error", f"Failed to complete license allocation: {error_msg}")
 
 if __name__ == "__main__":
     root = tk.Tk()
