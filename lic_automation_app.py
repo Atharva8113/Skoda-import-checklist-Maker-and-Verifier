@@ -319,7 +319,7 @@ class LicenseAutomationApp:
         lic_card.pack(fill='both', expand=True, side='top', pady=(0, 10))
         
         ttk.Label(lic_card, text="Active Licenses (Fetched from Cloud)", style='Section.TLabel').pack(anchor='w', pady=(0, 5))
-        ttk.Label(lic_card, text="Sorts automatically by expiry date. Check/uncheck to select licenses for allocation.", font=(FONT_FAMILY, 9, 'italic'), foreground="#666666").pack(anchor='w', pady=(0, 10))
+        ttk.Label(lic_card, text="Retains database master order. Check/uncheck to select licenses for allocation.", font=(FONT_FAMILY, 9, 'italic'), foreground="#666666").pack(anchor='w', pady=(0, 10))
         
         # Treeview for active licenses
         tree_scroll_y = ttk.Scrollbar(lic_card, orient='vertical')
@@ -983,7 +983,8 @@ class LicenseAutomationApp:
                     self.selected_duty_covered += bal_val
                     selected_lics.append({
                         'lic_no': values[1],
-                        'bal': bal_val
+                        'bal': bal_val,
+                        'type': values[3]
                     })
                 except ValueError:
                     pass
@@ -992,53 +993,75 @@ class LicenseAutomationApp:
         self.update_summary_card()
 
     def simulate_debit(self, selected_lics):
-        """Simulate the greedy allocation with "all-or-nothing" item coverage and dynamic single-type scheme rules."""
+        """Simulate greedy allocation in strict database (top-to-bottom) order.
+        
+        For each item:
+          1. Walk the license list top-to-bottom.
+          2. The FIRST license with available balance determines the type for that item.
+          3. Continue consuming from subsequent licenses of the SAME type until the
+             item's duty is fully covered (all-or-nothing per type).
+          4. If the chosen type cannot cover the item fully, try the next type that
+             the NEXT available license belongs to.
+        """
         if not hasattr(self, 'item_duties') or not self.item_duties:
             return 0.0, {}
             
         lics = [dict(l) for l in selected_lics]
         license_debit_totals = {lic['lic_no']: 0.0 for lic in lics}
         
-        # Get order of license types represented in the selected list
-        candidate_types = []
-        for lic in lics:
-            t = str(lic['type']).strip().upper()
-            if t not in candidate_types:
-                candidate_types.append(t)
-                
         for item_data in self.item_duties:
             duty = item_data['duty']
             if duty <= 0.0:
                 continue
+            
+            # Walk top-to-bottom to find the first available license
+            # Its type becomes the candidate type for this item
+            tried_types = set()
+            covered = False
+            
+            for start_idx, start_lic in enumerate(lics):
+                lic_type = str(start_lic['type']).strip().upper()
+                if lic_type in tried_types:
+                    continue
+                max_start = start_lic['bal'] - 1.00
+                if max_start <= 0.01:
+                    continue
+                    
+                # Found a candidate type — check if ALL licenses of this type
+                # (in order) can cover the full duty
+                total_avail = sum(
+                    max(0.0, l['bal'] - 1.00)
+                    for l in lics
+                    if str(l['type']).strip().upper() == lic_type
+                )
                 
-            # Try to find a license type that can cover this item's duty fully
-            for lic_type in candidate_types:
-                matching_lics = [lic for lic in lics if str(lic['type']).strip().upper() == lic_type]
-                total_avail = sum(max(0.0, lic['bal'] - 1.00) for lic in matching_lics)
+                if total_avail < duty:
+                    tried_types.add(lic_type)
+                    continue
                 
-                if total_avail >= duty:
-                    # Allocate fully from matching licenses sequentially
-                    duty_remaining = duty
-                    for lic in lics:
-                        if duty_remaining <= 0.005:
-                            break
-                        if str(lic['type']).strip().upper() != lic_type:
-                            continue
-                        max_debitable = lic['bal'] - 1.00
-                        if max_debitable <= 0.01:
-                            continue
-                            
-                        if max_debitable >= duty_remaining:
-                            debit_amt = duty_remaining
-                            lic['bal'] -= debit_amt
-                            license_debit_totals[lic['lic_no']] += debit_amt
-                            duty_remaining = 0.0
-                        else:
-                            debit_amt = max_debitable
-                            lic['bal'] = 1.00
-                            license_debit_totals[lic['lic_no']] += debit_amt
-                            duty_remaining -= debit_amt
-                    break # Covered item, stop trying other types
+                # Allocate from licenses of this type in top-to-bottom order
+                duty_remaining = duty
+                for lic in lics:
+                    if duty_remaining <= 0.005:
+                        break
+                    if str(lic['type']).strip().upper() != lic_type:
+                        continue
+                    max_debitable = lic['bal'] - 1.00
+                    if max_debitable <= 0.01:
+                        continue
+                        
+                    if max_debitable >= duty_remaining:
+                        debit_amt = duty_remaining
+                        lic['bal'] -= debit_amt
+                        license_debit_totals[lic['lic_no']] += debit_amt
+                        duty_remaining = 0.0
+                    else:
+                        debit_amt = max_debitable
+                        lic['bal'] = 1.00
+                        license_debit_totals[lic['lic_no']] += debit_amt
+                        duty_remaining -= debit_amt
+                covered = True
+                break  # Item covered, move to next item
                     
         total_estimated_debit = sum(license_debit_totals.values())
         return total_estimated_debit, license_debit_totals
@@ -1122,6 +1145,15 @@ class LicenseAutomationApp:
             
             wb_jd.close()
             
+            # Index items_rows by InvSrNo for O(1) subset lookup
+            items_by_inv_sr = {}
+            for r_idx, item_row in enumerate(items_rows[1:], start=2):
+                if item_row[item_inv_sr_idx] is not None:
+                    itm_inv_sr = str(item_row[item_inv_sr_idx]).strip()
+                    if itm_inv_sr not in items_by_inv_sr:
+                        items_by_inv_sr[itm_inv_sr] = []
+                    items_by_inv_sr[itm_inv_sr].append((r_idx, item_row))
+            
             # Match each item from the report to check for Exim_Code 14 and store scheme
             item_duties = []
             restricted_count = 0
@@ -1141,19 +1173,17 @@ class LicenseAutomationApp:
                 is_restricted = False
                 
                 if inv_sr and exim_code_idx != -1:
-                    for item_row in items_rows[1:]:
-                        if item_row[item_inv_sr_idx] is not None:
-                            itm_inv_sr = str(item_row[item_inv_sr_idx]).strip()
-                            if itm_inv_sr == inv_sr:
-                                itm_desc = str(item_row[desc_idx]).strip() if item_row[desc_idx] is not None else ""
-                                itm_qty = safe_float(item_row[qty_idx])
-                                itm_cth = str(item_row[cth_idx]).strip() if item_row[cth_idx] is not None else ""
-                                
-                                if itm_desc == rep_desc and abs(itm_qty - rep_qty) < 0.01 and itm_cth == rep_cth:
-                                    exim_code_val = str(item_row[exim_code_idx]).strip()
-                                    if exim_code_val == '14' or exim_code_val == '14.0':
-                                        is_restricted = True
-                                    break
+                    candidates = items_by_inv_sr.get(inv_sr, [])
+                    for r_idx, item_row in candidates:
+                        itm_desc = str(item_row[desc_idx]).strip() if item_row[desc_idx] is not None else ""
+                        itm_qty = safe_float(item_row[qty_idx])
+                        itm_cth = str(item_row[cth_idx]).strip() if item_row[cth_idx] is not None else ""
+                        
+                        if itm_desc == rep_desc and abs(itm_qty - rep_qty) < 0.01 and itm_cth == rep_cth:
+                            exim_code_val = str(item_row[exim_code_idx]).strip()
+                            if exim_code_val == '14' or exim_code_val == '14.0':
+                                is_restricted = True
+                            break
                 
                 if is_restricted:
                     duty = 0.0
@@ -1300,7 +1330,7 @@ class LicenseAutomationApp:
         messagebox.showerror("Error", f"Failed to analyze files: {error_msg}")
 
     def populate_license_table(self):
-        """Fill treeview table and auto-check the licenses that will actually be utilized, placing them at the top."""
+        """Fill treeview table and auto-check the licenses that will actually be utilized, retaining database order."""
         for item_id in self.lic_tree.get_children():
             self.lic_tree.delete(item_id)
             
@@ -1308,21 +1338,10 @@ class LicenseAutomationApp:
         candidate_lics = [item for item in self.active_licenses if item['bal'] >= 3.00]
         _, debit_totals = self.simulate_debit(candidate_lics)
         
-        selected_items = []
-        unselected_items = []
-        
         for item in self.active_licenses:
             is_used = (debit_totals.get(item['lic_no'], 0.0) > 0.0)
             item['auto_selected'] = is_used
-            if is_used:
-                selected_items.append(item)
-            else:
-                unselected_items.append(item)
-                
-        # Combine lists with selected ones at the top
-        ordered_licenses = selected_items + unselected_items
-        
-        for item in ordered_licenses:
+            
             exp_str = item['expiry'].strftime('%d-%b-%Y') if item['expiry'] is not None else "N/A"
             selected_str = "☑" if item['auto_selected'] else "☐"
             
@@ -1360,19 +1379,9 @@ class LicenseAutomationApp:
         be_no_val = self.job_info['be_no'] if str(self.job_info['be_no']).lower() != 'nan' else "Pending / Empty"
         be_date_val = self.job_info['be_date_str'] if str(self.job_info['be_date_str']).lower() != 'nan' else "Pending / Empty"
         
-        scheme_val = self.job_info['scheme'].upper()
-        if scheme_val == "RD":
-            scheme_display = "RODTEP"
-        elif scheme_val == "NAN":
-            scheme_display = "Pending / Empty"
-        else:
-            scheme_display = scheme_val
-            
         ttk.Label(self.summary_text_frame, text=f"Job Number: {self.job_info['job_no']}", style='Summary.TLabel').pack(**grid_params)
         ttk.Label(self.summary_text_frame, text=f"Bill of Entry No: {be_no_val}", style='Summary.TLabel').pack(**grid_params)
         ttk.Label(self.summary_text_frame, text=f"Bill of Entry Date: {be_date_val}", style='Summary.TLabel').pack(**grid_params)
-        ttk.Label(self.summary_text_frame, text=f"Import Port: {self.job_info['import_port']}", style='Summary.TLabel').pack(**grid_params)
-        ttk.Label(self.summary_text_frame, text=f"Required License Type: {scheme_display}", style='Summary.TLabel').pack(**grid_params)
         ttk.Label(self.summary_text_frame, text=f"Total Items in Checklist: {self.job_info['total_items']}", style='Summary.TLabel').pack(**grid_params)
         
         separator = ttk.Separator(self.summary_text_frame, orient='horizontal')
@@ -1468,11 +1477,15 @@ class LicenseAutomationApp:
             job_license_rows = []
             license_debit_totals = {lic['lic_no']: 0.0 for lic in selected_lics}
             
-            candidate_types = []
-            for lic in selected_lics:
-                t = str(lic['type']).strip().upper()
-                if t not in candidate_types:
-                    candidate_types.append(t)
+            # Index items_rows by InvSrNo for O(1) subset lookup
+            items_by_inv_sr = {}
+            for r_idx, item_row in enumerate(items_rows[1:], start=2):
+                if item_row[item_inv_sr_idx] is not None:
+                    itm_inv_sr = str(item_row[item_inv_sr_idx]).strip()
+                    if itm_inv_sr not in items_by_inv_sr:
+                        items_by_inv_sr[itm_inv_sr] = []
+                    items_by_inv_sr[itm_inv_sr].append((r_idx, item_row))
+            
             
             for idx, r_row in df_rep.iterrows():
                 rep_inv_no = str(r_row['Invoice No']).strip()
@@ -1489,22 +1502,20 @@ class LicenseAutomationApp:
                 is_restricted = False
                 
                 if inv_sr:
-                    for r_idx, item_row in enumerate(items_rows[1:], start=2):
-                        if item_row[item_inv_sr_idx] is not None:
-                            itm_inv_sr = str(item_row[item_inv_sr_idx]).strip()
-                            if itm_inv_sr == inv_sr:
-                                itm_desc = str(item_row[desc_idx]).strip() if item_row[desc_idx] is not None else ""
-                                itm_qty = safe_float(item_row[qty_idx])
-                                itm_cth = str(item_row[cth_idx]).strip() if item_row[cth_idx] is not None else ""
-                                
-                                if itm_desc == rep_desc and abs(itm_qty - rep_qty) < 0.01 and itm_cth == rep_cth:
-                                    item_sr = str(item_row[item_sr_idx]).strip()
-                                    matched_row_idx = r_idx
-                                    if exim_code_idx != -1:
-                                        exim_code_val = str(item_row[exim_code_idx]).strip()
-                                        if exim_code_val == '14' or exim_code_val == '14.0':
-                                            is_restricted = True
-                                    break
+                    candidates = items_by_inv_sr.get(inv_sr, [])
+                    for r_idx, item_row in candidates:
+                        itm_desc = str(item_row[desc_idx]).strip() if item_row[desc_idx] is not None else ""
+                        itm_qty = safe_float(item_row[qty_idx])
+                        itm_cth = str(item_row[cth_idx]).strip() if item_row[cth_idx] is not None else ""
+                        
+                        if itm_desc == rep_desc and abs(itm_qty - rep_qty) < 0.01 and itm_cth == rep_cth:
+                            item_sr = str(item_row[item_sr_idx]).strip()
+                            matched_row_idx = r_idx
+                            if exim_code_idx != -1:
+                                exim_code_val = str(item_row[exim_code_idx]).strip()
+                                if exim_code_val == '14' or exim_code_val == '14.0':
+                                    is_restricted = True
+                            break
                 
                 if not item_sr:
                     self.safe_log(f"Warning: Could not match item row {idx} (Desc: {rep_desc[:30]}...) to ITEMS sheet. Skipping.")
@@ -1573,14 +1584,26 @@ class LicenseAutomationApp:
                                 ws_items.cell(row=matched_row_idx, column=exim_notn_sr_idx + 1, value=exim_notn_sr_val)
                     continue
 
-                # Find which type can cover this item's duty fully
+                # Find which type can cover this item by walking licenses top-to-bottom
                 allocated_type = None
-                for lic_type in candidate_types:
-                    matching_lics = [lic for lic in selected_lics if str(lic['type']).strip().upper() == lic_type]
-                    total_avail = sum(max(0.0, lic['bal'] - 1.00) for lic in matching_lics)
+                tried_types = set()
+                for lic in selected_lics:
+                    lic_type = str(lic['type']).strip().upper()
+                    if lic_type in tried_types:
+                        continue
+                    if lic['bal'] - 1.00 <= 0.01:
+                        continue
+                    # This is the first license in line with balance — check if its type can cover fully
+                    total_avail = sum(
+                        max(0.0, l['bal'] - 1.00)
+                        for l in selected_lics
+                        if str(l['type']).strip().upper() == lic_type
+                    )
                     if total_avail >= duty:
                         allocated_type = lic_type
                         break
+                    else:
+                        tried_types.add(lic_type)
                         
                 if not allocated_type:
                     self.safe_log(f"Skipping item {idx+1} (Duty: {duty:.2f} INR) - Insufficient remaining balance in any single license type to cover it fully to 0.")
