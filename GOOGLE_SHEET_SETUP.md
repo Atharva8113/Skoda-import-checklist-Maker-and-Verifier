@@ -11,6 +11,8 @@ Follow these simple steps to configure your central license master database in G
    **`Data`**
 4. Create a second sheet tab (at the bottom) and name it exactly:
    **`Debit Ledger`**
+5. Create a third sheet tab (at the bottom) and name it exactly:
+   **`Used License`**
 
 ---
 
@@ -149,8 +151,32 @@ function doPost(e) {
               }
             });
             
-            // Write updated values back to Data sheet
-            dataRange.setValues(dataValues);
+            // Re-partition rows: keep active ones, move completed ones to "Used License"
+            const keepRows = [dataValues[0]];
+            const moveRows = [];
+            for (let i = 1; i < dataValues.length; i++) {
+              const balance = parseFloat(dataValues[i][balIdx]) || 0;
+              if (balance <= 1.0) {
+                moveRows.push(dataValues[i]);
+              } else {
+                keepRows.push(dataValues[i]);
+              }
+            }
+            
+            // Clear Data sheet and write back active rows
+            dataSheet.clearContents();
+            dataSheet.getRange(1, 1, keepRows.length, keepRows[0].length).setValues(keepRows);
+            
+            // Append moveRows to Used License sheet
+            if (moveRows.length > 0) {
+              let usedLicSheet = ss.getSheetByName("Used License");
+              if (!usedLicSheet) {
+                usedLicSheet = ss.insertSheet("Used License");
+                usedLicSheet.getRange(1, 1, 1, dataValues[0].length).setValues([dataValues[0]]);
+              }
+              const lastRow = usedLicSheet.getLastRow();
+              usedLicSheet.getRange(lastRow + 1, 1, moveRows.length, moveRows[0].length).setValues(moveRows);
+            }
           }
         }
       }
@@ -167,10 +193,13 @@ function doPost(e) {
       
       const newLicenses = data.licenses;
       
-      // Bulk append new licenses to Data sheet
       if (newLicenses.length > 0) {
-        const newRows = newLicenses.map(function(l) {
-          return [
+        const keepRows = [];
+        const moveRows = [];
+        
+        newLicenses.forEach(function(l) {
+          const balance = l.balance !== undefined ? l.balance : l.val;
+          const row = [
             l.lic_no,
             l.date,
             l.port,
@@ -182,9 +211,31 @@ function doPost(e) {
             l.balance !== undefined ? l.balance : l.val,
             l.job_no !== undefined ? l.job_no : ""
           ];
+          
+          if (balance <= 1.0) {
+            moveRows.push(row);
+          } else {
+            keepRows.push(row);
+          }
         });
-        const lastRow = dataSheet.getLastRow();
-        dataSheet.getRange(lastRow + 1, 1, newRows.length, newRows[0].length).setValues(newRows);
+        
+        // Append active ones to Data sheet
+        if (keepRows.length > 0) {
+          const lastRow = dataSheet.getLastRow();
+          dataSheet.getRange(lastRow + 1, 1, keepRows.length, keepRows[0].length).setValues(keepRows);
+        }
+        
+        // Append depleted ones to Used License sheet
+        if (moveRows.length > 0) {
+          let usedLicSheet = ss.getSheetByName("Used License");
+          if (!usedLicSheet) {
+            usedLicSheet = ss.insertSheet("Used License");
+            const header = dataSheet.getRange(1, 1, 1, 10).getValues()[0];
+            usedLicSheet.getRange(1, 1, 1, header.length).setValues([header]);
+          }
+          const lastRow = usedLicSheet.getLastRow();
+          usedLicSheet.getRange(lastRow + 1, 1, moveRows.length, moveRows[0].length).setValues(moveRows);
+        }
       }
       
       return ContentService.createTextOutput(JSON.stringify({ success: true }))
@@ -211,6 +262,50 @@ function formatRows(ss, rows) {
       return cell;
     });
   });
+}
+
+// One-time utility: Run this from the Apps Script editor to move all existing used licenses from 'Data' to 'Used License'
+function moveExistingUsedLicenses() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const dataSheet = ss.getSheetByName("Data");
+  if (!dataSheet) return;
+  
+  const dataRange = dataSheet.getDataRange();
+  const dataValues = dataRange.getValues();
+  if (dataValues.length <= 1) return;
+  
+  const header = dataValues[0].map(function(h) { return String(h).trim().toUpperCase(); });
+  const balIdx = header.indexOf('BALANCE');
+  if (balIdx === -1) return;
+  
+  const keepRows = [dataValues[0]];
+  const moveRows = [];
+  
+  for (let i = 1; i < dataValues.length; i++) {
+    const balance = parseFloat(dataValues[i][balIdx]) || 0;
+    if (balance <= 1.0) {
+      moveRows.push(dataValues[i]);
+    } else {
+      keepRows.push(dataValues[i]);
+    }
+  }
+  
+  if (moveRows.length > 0) {
+    dataSheet.clearContents();
+    dataSheet.getRange(1, 1, keepRows.length, keepRows[0].length).setValues(keepRows);
+    
+    let usedLicSheet = ss.getSheetByName("Used License");
+    if (!usedLicSheet) {
+      usedLicSheet = ss.insertSheet("Used License");
+      usedLicSheet.getRange(1, 1, 1, dataValues[0].length).setValues([dataValues[0]]);
+    }
+    const lastRow = usedLicSheet.getLastRow();
+    usedLicSheet.getRange(lastRow + 1, 1, moveRows.length, moveRows[0].length).setValues(moveRows);
+    
+    Logger.log("Successfully moved " + moveRows.length + " existing used licenses to 'Used License' sheet.");
+  } else {
+    Logger.log("No used licenses found to move.");
+  }
 }
 ```
 

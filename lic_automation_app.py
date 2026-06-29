@@ -1085,9 +1085,88 @@ class LicenseAutomationApp:
             if missing:
                 raise ValueError(f"Import Item Report is missing required column(s): {missing}")
             
-            df_rep['calc_duty'] = (df_rep['Assessable Value (INR)'] * df_rep['Basic Duty Rate'] / 100.0).round(2)
-            required_duty = round(df_rep['calc_duty'].sum(), 2)
-            item_duties = df_rep['calc_duty'].tolist()
+            self.safe_log("Reading JobData sheets (GENERAL, INVOICES, ITEMS) for analysis...")
+            wb_jd = openpyxl.load_workbook(jd_path, read_only=True)
+            if 'GENERAL' not in wb_jd.sheetnames:
+                raise ValueError("GENERAL sheet not found in JobData workbook.")
+            ws_gen = wb_jd['GENERAL']
+            rows_gen = list(ws_gen.iter_rows(values_only=True))
+            headers_gen = [str(h).strip().upper() for h in rows_gen[0]]
+            
+            if 'CUSTOMSHOUSECODE' not in headers_gen:
+                raise ValueError("Column CUSTOMSHOUSECODE not found in JobData GENERAL sheet.")
+            port_col_idx = headers_gen.index('CUSTOMSHOUSECODE')
+            import_port = str(rows_gen[1][port_col_idx]).strip()
+            
+            # Map invoices to get InvSrNo
+            if 'INVOICES' not in wb_jd.sheetnames:
+                raise ValueError("INVOICES sheet not found in JobData workbook.")
+            ws_inv = wb_jd['INVOICES']
+            inv_rows = list(ws_inv.iter_rows(values_only=True))
+            inv_header = [str(h).strip() for h in inv_rows[0]]
+            inv_sr_idx = inv_header.index('InvSrNo')
+            inv_no_idx = inv_header.index('Invoice_No')
+            
+            inv_map = {}
+            for r in inv_rows[1:]:
+                if r[inv_sr_idx] is not None and r[inv_no_idx] is not None:
+                    inv_map[str(r[inv_no_idx]).strip()] = str(r[inv_sr_idx]).strip()
+            
+            # Read ITEMS sheet
+            if 'ITEMS' not in wb_jd.sheetnames:
+                raise ValueError("ITEMS sheet not found in JobData workbook.")
+            ws_items = wb_jd['ITEMS']
+            items_rows = list(ws_items.iter_rows(values_only=True))
+            items_header = [str(h).strip() for h in items_rows[0]]
+            item_inv_sr_idx = items_header.index('InvSrNo')
+            item_sr_idx = items_header.index('ItemSrNo')
+            desc_idx = items_header.index('Product_Description')
+            qty_idx = items_header.index('QTY')
+            cth_idx = items_header.index('CTH')
+            exim_code_idx = items_header.index('Exim_Code') if 'Exim_Code' in items_header else -1
+            
+            wb_jd.close()
+            
+            # Match each item from the report to check for Exim_Code 14
+            item_duties = []
+            restricted_count = 0
+            for idx, r_row in df_rep.iterrows():
+                rep_inv_no = str(r_row['Invoice No']).strip()
+                rep_desc = str(r_row['Product Desc']).strip()
+                rep_qty = safe_float(r_row['Quantity'])
+                rep_cth = str(r_row['CTH']).strip()
+                
+                av = safe_float(r_row['Assessable Value (INR)'])
+                rate = safe_float(r_row['Basic Duty Rate'])
+                
+                inv_sr = inv_map.get(rep_inv_no)
+                is_restricted = False
+                
+                if inv_sr and exim_code_idx != -1:
+                    for item_row in items_rows[1:]:
+                        if item_row[item_inv_sr_idx] is not None:
+                            itm_inv_sr = str(item_row[item_inv_sr_idx]).strip()
+                            if itm_inv_sr == inv_sr:
+                                itm_desc = str(item_row[desc_idx]).strip() if item_row[desc_idx] is not None else ""
+                                itm_qty = safe_float(item_row[qty_idx])
+                                itm_cth = str(item_row[cth_idx]).strip() if item_row[cth_idx] is not None else ""
+                                
+                                if itm_desc == rep_desc and abs(itm_qty - rep_qty) < 0.01 and itm_cth == rep_cth:
+                                    exim_code_val = str(item_row[exim_code_idx]).strip()
+                                    if exim_code_val == '14' or exim_code_val == '14.0':
+                                        is_restricted = True
+                                    break
+                
+                if is_restricted:
+                    duty = 0.0
+                    restricted_count += 1
+                    self.safe_log(f"Row {idx+1}: Item '{rep_desc[:25]}' has Exim_Code 14 (Restricted). Skipping license allocation.")
+                else:
+                    duty = round(av * rate / 100.0, 2)
+                    
+                item_duties.append(duty)
+            
+            required_duty = round(sum(item_duties), 2)
             
             raw_be_no = df_rep.loc[0, 'BE No']
             be_no = str(raw_be_no).strip() if not pd.isna(raw_be_no) else "nan"
@@ -1118,20 +1197,6 @@ class LicenseAutomationApp:
                 
             total_items = len(df_rep)
             
-            self.safe_log("Reading JobData general details...")
-            wb_jd = openpyxl.load_workbook(jd_path, read_only=True)
-            if 'GENERAL' not in wb_jd.sheetnames:
-                raise ValueError("GENERAL sheet not found in JobData workbook.")
-            ws_gen = wb_jd['GENERAL']
-            rows_gen = list(ws_gen.iter_rows(values_only=True))
-            headers_gen = [str(h).strip().upper() for h in rows_gen[0]]
-            
-            if 'CUSTOMSHOUSECODE' not in headers_gen:
-                raise ValueError("Column CUSTOMSHOUSECODE not found in JobData GENERAL sheet.")
-            port_col_idx = headers_gen.index('CUSTOMSHOUSECODE')
-            import_port = str(rows_gen[1][port_col_idx]).strip()
-            wb_jd.close()
-            
             job_info = {
                 'be_no': be_no,
                 'be_date': be_date,
@@ -1143,6 +1208,8 @@ class LicenseAutomationApp:
             }
             
             self.safe_log(f"Job Details: Job No: {job_no}, BE No: {be_no}, Import Port: {import_port}, Scheme: {scheme_code}")
+            if restricted_count > 0:
+                self.safe_log(f"Note: Found {restricted_count} restricted item(s) (Exim_Code 14) which won't use licenses.")
             self.safe_log(f"Total Checklist Items: {total_items}, Required License Duty: {required_duty:,.2f} INR")
             
             # Load active licenses from Google Sheet API
@@ -1398,6 +1465,10 @@ class LicenseAutomationApp:
             qty_idx = items_header.index('QTY')
             cth_idx = items_header.index('CTH')
             
+            exim_code_idx = items_header.index('Exim_Code') if 'Exim_Code' in items_header else -1
+            exim_notn_idx = items_header.index('Exim_Notn') if 'Exim_Notn' in items_header else -1
+            exim_notn_sr_idx = items_header.index('Exim_NotnSrNo') if 'Exim_NotnSrNo' in items_header else -1
+            
             self.safe_log("Running allocation algorithm...")
             lic_ptr = 0
             job_license_rows = []
@@ -1414,9 +1485,11 @@ class LicenseAutomationApp:
                 
                 inv_sr = inv_map.get(rep_inv_no)
                 item_sr = None
+                matched_row_idx = None
+                is_restricted = False
                 
                 if inv_sr:
-                    for item_row in items_rows[1:]:
+                    for r_idx, item_row in enumerate(items_rows[1:], start=2):
                         if item_row[item_inv_sr_idx] is not None:
                             itm_inv_sr = str(item_row[item_inv_sr_idx]).strip()
                             if itm_inv_sr == inv_sr:
@@ -1426,10 +1499,19 @@ class LicenseAutomationApp:
                                 
                                 if itm_desc == rep_desc and abs(itm_qty - rep_qty) < 0.01 and itm_cth == rep_cth:
                                     item_sr = str(item_row[item_sr_idx]).strip()
+                                    matched_row_idx = r_idx
+                                    if exim_code_idx != -1:
+                                        exim_code_val = str(item_row[exim_code_idx]).strip()
+                                        if exim_code_val == '14' or exim_code_val == '14.0':
+                                            is_restricted = True
                                     break
                 
                 if not item_sr:
                     self.safe_log(f"Warning: Could not match item row {idx} (Desc: {rep_desc[:30]}...) to ITEMS sheet. Skipping.")
+                    continue
+                
+                if is_restricted:
+                    self.safe_log(f"Skipping item {idx+1} (Desc: {rep_desc[:25]}) - Restricted item (Exim_Code 14). Row in ITEMS sheet is kept as it is.")
                     continue
                 
                 duty = round(av * rate / 100.0, 2)
@@ -1455,6 +1537,40 @@ class LicenseAutomationApp:
                             'Basic_Duty_Rate': rate,
                             'Basic_Duty_Value': 0.00
                         })
+                        # Update exim values based on license type
+                        lic_type = str(curr_lic['type']).strip().upper()
+                        if 'ROSCTL' in lic_type:
+                            exim_code_val = 'RS'
+                            exim_notn_val = 'ROSCTL'
+                            exim_notn_sr_val = 1
+                        elif 'RODTEP' in lic_type or 'RD' in lic_type:
+                            exim_code_val = 'RD'
+                            exim_notn_val = 'RODTEP'
+                            exim_notn_sr_val = 1
+                        elif 'DFIA' in lic_type:
+                            exim_code_val = 'DF'
+                            exim_notn_val = 'DFIA'
+                            exim_notn_sr_val = 1
+                        elif 'EPCG' in lic_type:
+                            exim_code_val = 'EP'
+                            exim_notn_val = 'EPCG'
+                            exim_notn_sr_val = 1
+                        elif 'ADVANCE' in lic_type:
+                            exim_code_val = 'AA'
+                            exim_notn_val = 'ADVANCE AUTHORISATION'
+                            exim_notn_sr_val = 1
+                        else:
+                            exim_code_val = 'RD'
+                            exim_notn_val = 'RODTEP'
+                            exim_notn_sr_val = 1
+                            
+                        if matched_row_idx:
+                            if exim_code_idx != -1:
+                                ws_items.cell(row=matched_row_idx, column=exim_code_idx + 1, value=exim_code_val)
+                            if exim_notn_idx != -1:
+                                ws_items.cell(row=matched_row_idx, column=exim_notn_idx + 1, value=exim_notn_val)
+                            if exim_notn_sr_idx != -1:
+                                ws_items.cell(row=matched_row_idx, column=exim_notn_sr_idx + 1, value=exim_notn_sr_val)
                     continue
 
                 # Check total available balance of all selected licenses starting from current pointer
@@ -1530,6 +1646,42 @@ class LicenseAutomationApp:
                         lic_ptr += 1
                         if lic_ptr < len(selected_lics):
                             self.safe_log(f"License depleted (left with exactly 1.00 balance). Switching to License: {selected_lics[lic_ptr]['lic_no']}")
+                
+                # After the debiting loop for this item has processed (and if it was successfully debited),
+                # we update the EXIM columns in ws_items!
+                if duty_remaining == 0 and matched_row_idx:
+                    lic_type = str(curr_lic['type']).strip().upper()
+                    if 'ROSCTL' in lic_type:
+                        exim_code_val = 'RS'
+                        exim_notn_val = 'ROSCTL'
+                        exim_notn_sr_val = 1
+                    elif 'RODTEP' in lic_type or 'RD' in lic_type:
+                        exim_code_val = 'RD'
+                        exim_notn_val = 'RODTEP'
+                        exim_notn_sr_val = 1
+                    elif 'DFIA' in lic_type:
+                        exim_code_val = 'DF'
+                        exim_notn_val = 'DFIA'
+                        exim_notn_sr_val = 1
+                    elif 'EPCG' in lic_type:
+                        exim_code_val = 'EP'
+                        exim_notn_val = 'EPCG'
+                        exim_notn_sr_val = 1
+                    elif 'ADVANCE' in lic_type:
+                        exim_code_val = 'AA'
+                        exim_notn_val = 'ADVANCE AUTHORISATION'
+                        exim_notn_sr_val = 1
+                    else:
+                        exim_code_val = 'RD'
+                        exim_notn_val = 'RODTEP'
+                        exim_notn_sr_val = 1
+                        
+                    if exim_code_idx != -1:
+                        ws_items.cell(row=matched_row_idx, column=exim_code_idx + 1, value=exim_code_val)
+                    if exim_notn_idx != -1:
+                        ws_items.cell(row=matched_row_idx, column=exim_notn_idx + 1, value=exim_notn_val)
+                    if exim_notn_sr_idx != -1:
+                        ws_items.cell(row=matched_row_idx, column=exim_notn_sr_idx + 1, value=exim_notn_sr_val)
 
             self.safe_log("Writing to JobData LICENSE sheet...")
             if 'LICENSE' not in wb_jd.sheetnames:
