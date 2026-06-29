@@ -202,63 +202,54 @@ class LicenseAutomationApp:
     def build_ui(self):
         """Assemble the main window components."""
         # --- HEADER BLOCK ---
-        header_frame = tk.Frame(self.root, bg=COLOR_PRIMARY, height=80)
+        header_frame = tk.Frame(self.root, bg='#FFFFFF', height=60)
         header_frame.pack(fill='x', side='top')
         header_frame.pack_propagate(False)
         
-        # White container box for logo
-        logo_container = tk.Frame(header_frame, bg='#FFFFFF', bd=0)
-        logo_container.pack(side='left', padx=20, pady=10, fill='y')
-        
-        # Logo handling (PIL-free fallback)
+        # Logo handling (Pillow LANCZOS high-quality resampling for crisp rendering)
         logo_loaded = False
         logo_path = os.path.join(os.path.dirname(os.path.abspath(__file__)) if '__file__' in globals() else os.getcwd(), "logo.png")
         if os.path.exists(logo_path):
             try:
-                self.logo_img = tk.PhotoImage(file=logo_path)
-                if self.logo_img.width() > 200 or self.logo_img.height() > 60:
-                    self.logo_img = self.logo_img.subsample(2)
+                from PIL import Image, ImageTk
+                pil_img = Image.open(logo_path)
+                target_h = 36
+                aspect = pil_img.width / pil_img.height
+                target_w = int(target_h * aspect)
+                resample_mode = getattr(Image, 'Resampling', Image).LANCZOS
+                resized_pil = pil_img.resize((target_w, target_h), resample_mode)
+                self.logo_img = ImageTk.PhotoImage(resized_pil)
                 
-                logo_label = tk.Label(logo_container, image=self.logo_img, bg='#FFFFFF')
-                logo_label.pack(padx=15, pady=5, expand=True)
+                logo_label = tk.Label(header_frame, image=self.logo_img, bg='#FFFFFF')
+                logo_label.place(x=20, rely=0.5, anchor='w')
                 logo_loaded = True
             except Exception as e:
-                print(f"Warning: Logo failed to load: {e}")
+                try:
+                    self.logo_img = tk.PhotoImage(file=logo_path)
+                    sub_factor = max(1, self.logo_img.height() // 36)
+                    self.logo_img = self.logo_img.subsample(sub_factor)
+                    logo_label = tk.Label(header_frame, image=self.logo_img, bg='#FFFFFF')
+                    logo_label.place(x=20, rely=0.5, anchor='w')
+                    logo_loaded = True
+                except Exception:
+                    pass
         
         if not logo_loaded:
-            logo_label = tk.Label(logo_container, text=" NAGARKOT ", fg=COLOR_PRIMARY, bg='#FFFFFF', font=(FONT_FAMILY, 14, 'bold'))
-            logo_label.pack(padx=15, pady=8, expand=True)
+            logo_label = tk.Label(header_frame, text="NAGARKOT", fg=COLOR_PRIMARY, bg='#FFFFFF', font=(FONT_FAMILY, 14, 'bold'))
+            logo_label.place(x=20, rely=0.5, anchor='w')
             
-        # Centered Text Frame for Title and Subtitle
-        text_frame = tk.Frame(header_frame, bg=COLOR_PRIMARY)
-        text_frame.pack(side='left', expand=True, fill='both', pady=12)
-        
+        # Centrally aligned Title across header width
         title_label = tk.Label(
-            text_frame, 
-            text="SHAKTI SKODA LICENSE MANAGER", 
-            fg="#FFFFFF", 
-            bg=COLOR_PRIMARY, 
-            font=(FONT_FAMILY, 16, 'bold'),
-            anchor='center'
+            header_frame, 
+            text="SKODA LICENSE MANAGER", 
+            fg=COLOR_PRIMARY, 
+            bg='#FFFFFF', 
+            font=(FONT_FAMILY, 18, 'bold')
         )
-        title_label.pack(fill='x', expand=True)
+        title_label.place(relx=0.5, rely=0.5, anchor='center')
         
-        subtitle_label = tk.Label(
-            text_frame, 
-            text="Nagarkot Forwarders License Exemption & Debit Utility", 
-            fg="#A0C4DF", 
-            bg=COLOR_PRIMARY, 
-            font=(FONT_FAMILY, 9, 'italic'),
-            anchor='center'
-        )
-        subtitle_label.pack(fill='x', expand=True)
-        
-        # Right spacer to balance the left logo container and keep text perfectly centered
-        right_spacer = tk.Frame(header_frame, bg=COLOR_PRIMARY, width=150)
-        right_spacer.pack(side='right', fill='y')
-        
-        # Subtle light/medium blue divider bar under header
-        accent_line = tk.Frame(self.root, bg=COLOR_SECONDARY, height=4)
+        # Subtle divider bar under header
+        accent_line = tk.Frame(self.root, bg=COLOR_PRIMARY, height=3)
         accent_line.pack(fill='x', side='top')
         
         # --- NOTEBOOK FOR TABS ---
@@ -343,18 +334,22 @@ class LicenseAutomationApp:
         ttk.Label(lic_card, text="Sorts automatically by expiry date. Check/uncheck to select licenses for allocation.", font=(FONT_FAMILY, 9, 'italic'), foreground="#666666").pack(anchor='w', pady=(0, 10))
         
         # Treeview for active licenses
-        tree_scroll = ttk.Scrollbar(lic_card)
-        tree_scroll.pack(side='right', fill='y')
+        tree_scroll_y = ttk.Scrollbar(lic_card, orient='vertical')
+        tree_scroll_y.pack(side='right', fill='y')
+        tree_scroll_x = ttk.Scrollbar(lic_card, orient='horizontal')
+        tree_scroll_x.pack(side='bottom', fill='x')
         
         self.lic_tree = ttk.Treeview(
             lic_card, 
             columns=('selected', 'lic_no', 'port', 'type', 'balance', 'expiry'), 
             show='headings', 
-            yscrollcommand=tree_scroll.set,
+            yscrollcommand=tree_scroll_y.set,
+            xscrollcommand=tree_scroll_x.set,
             selectmode='none'
         )
         self.lic_tree.pack(fill='both', expand=True)
-        tree_scroll.config(command=self.lic_tree.yview)
+        tree_scroll_y.config(command=self.lic_tree.yview)
+        tree_scroll_x.config(command=self.lic_tree.xview)
         
         self.lic_tree.tag_configure('near_expiry', foreground=COLOR_ERROR)
         self.lic_tree.tag_configure('checked', background="#E8F5E9")
@@ -495,12 +490,56 @@ class LicenseAutomationApp:
         self.excel_btn.pack(fill='x')
         
         # --- FOOTER BLOCK ---
-        footer_frame = tk.Frame(self.root, bg="#E2E2E2", height=30)
+        footer_frame = tk.Frame(self.root, bg="#E2E2E2", height=36)
         footer_frame.pack(fill='x', side='bottom')
         footer_frame.pack_propagate(False)
         
-        footer_label = tk.Label(footer_frame, text="Developed for Skoda Imports Automation | Central Google Sheet Mode", bg="#E2E2E2", fg="#555555", font=(FONT_FAMILY, 9))
-        footer_label.pack(pady=5)
+        # Left side container for logo & company name
+        footer_left = tk.Frame(footer_frame, bg="#E2E2E2")
+        footer_left.pack(side='left', padx=15, fill='y')
+        
+        # Logo handling for footer (High-quality Pillow resampling)
+        if os.path.exists(logo_path):
+            try:
+                from PIL import Image, ImageTk
+                pil_img_ft = Image.open(logo_path)
+                target_h_ft = 20
+                aspect_ft = pil_img_ft.width / pil_img_ft.height
+                target_w_ft = int(target_h_ft * aspect_ft)
+                resample_mode_ft = getattr(Image, 'Resampling', Image).LANCZOS
+                resized_pil_ft = pil_img_ft.resize((target_w_ft, target_h_ft), resample_mode_ft)
+                self.footer_logo_img = ImageTk.PhotoImage(resized_pil_ft)
+                
+                footer_logo_lbl = tk.Label(footer_left, image=self.footer_logo_img, bg="#E2E2E2")
+                footer_logo_lbl.pack(side='left', padx=(0, 8), pady=4)
+            except Exception:
+                try:
+                    self.footer_logo_img = tk.PhotoImage(file=logo_path)
+                    sub_factor = max(1, self.footer_logo_img.height() // 20)
+                    self.footer_logo_img = self.footer_logo_img.subsample(sub_factor)
+                    footer_logo_lbl = tk.Label(footer_left, image=self.footer_logo_img, bg="#E2E2E2")
+                    footer_logo_lbl.pack(side='left', padx=(0, 8), pady=4)
+                except Exception:
+                    pass
+                
+        footer_brand_lbl = tk.Label(
+            footer_left, 
+            text="Nagarkot Forwarders Pvt. Ltd. ©", 
+            bg="#E2E2E2", 
+            fg="#333333", 
+            font=(FONT_FAMILY, 9, 'bold')
+        )
+        footer_brand_lbl.pack(side='left', pady=7)
+        
+        # Right side container for system info
+        footer_right = tk.Label(
+            footer_frame, 
+            text="Developed for Skoda Imports Automation | Central Google Sheet Mode", 
+            bg="#E2E2E2", 
+            fg="#666666", 
+            font=(FONT_FAMILY, 8, 'italic')
+        )
+        footer_right.pack(side='right', padx=15, pady=8)
 
     def log(self, msg: str):
         """Append a message to the logging pane."""
