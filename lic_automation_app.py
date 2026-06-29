@@ -291,18 +291,7 @@ class LicenseAutomationApp:
         ttk.Entry(row_ir, textvariable=self.item_report_path).pack(side='left', fill='x', expand=True, padx=5)
         ttk.Button(row_ir, text="Browse", command=self.browse_item_report).pack(side='left')
         
-        # Select Scheme Dropdown Input
-        self.scheme_selection = tk.StringVar(value="Auto-Detect")
-        row_scheme = ttk.Frame(files_card, style='Card.TFrame')
-        row_scheme.pack(fill='x', pady=5)
-        ttk.Label(row_scheme, text="License Scheme:", width=18, anchor='w', style='Summary.TLabel').pack(side='left')
-        scheme_dropdown = ttk.Combobox(
-            row_scheme, 
-            textvariable=self.scheme_selection, 
-            values=["Auto-Detect", "RODTEP", "ROSCTL", "DFIA", "EPCG", "ADVANCE AUTHORISATION"],
-            state="readonly"
-        )
-        scheme_dropdown.pack(side='left', fill='x', expand=True, padx=5)
+
         
         # Load Data Button
         self.load_btn = ttk.Button(files_card, text="LOAD AND ANALYZE FILES", command=self.load_and_analyze_data)
@@ -1003,47 +992,53 @@ class LicenseAutomationApp:
         self.update_summary_card()
 
     def simulate_debit(self, selected_lics):
-        """Simulate the greedy allocation with "all-or-nothing" item coverage rule."""
+        """Simulate the greedy allocation with "all-or-nothing" item coverage and dynamic single-type scheme rules."""
         if not hasattr(self, 'item_duties') or not self.item_duties:
             return 0.0, {}
             
         lics = [dict(l) for l in selected_lics]
-        lic_ptr = 0
         license_debit_totals = {lic['lic_no']: 0.0 for lic in lics}
         
-        for duty in self.item_duties:
+        # Get order of license types represented in the selected list
+        candidate_types = []
+        for lic in lics:
+            t = str(lic['type']).strip().upper()
+            if t not in candidate_types:
+                candidate_types.append(t)
+                
+        for item_data in self.item_duties:
+            duty = item_data['duty']
             if duty <= 0.0:
                 continue
                 
-            # Check total available balance from current pointer onwards
-            total_avail = sum(max(0.0, lics[i]['bal'] - 1.00) for i in range(lic_ptr, len(lics)))
-            
-            # If we don't have enough total balance to cover this item's duty fully, skip it (pay cash)
-            if total_avail < duty:
-                continue
+            # Try to find a license type that can cover this item's duty fully
+            for lic_type in candidate_types:
+                matching_lics = [lic for lic in lics if str(lic['type']).strip().upper() == lic_type]
+                total_avail = sum(max(0.0, lic['bal'] - 1.00) for lic in matching_lics)
                 
-            # Otherwise, allocate fully
-            duty_remaining = duty
-            while duty_remaining > 0.005:
-                if lic_ptr >= len(lics):
-                    break
-                curr_lic = lics[lic_ptr]
-                max_debitable = curr_lic['bal'] - 1.00
-                if max_debitable <= 0.01:
-                    lic_ptr += 1
-                    continue
-                    
-                if max_debitable >= duty_remaining:
-                    debit_amt = duty_remaining
-                    curr_lic['bal'] -= debit_amt
-                    license_debit_totals[curr_lic['lic_no']] += debit_amt
-                    duty_remaining = 0.0
-                else:
-                    debit_amt = max_debitable
-                    curr_lic['bal'] = 1.00
-                    license_debit_totals[curr_lic['lic_no']] += debit_amt
-                    duty_remaining -= debit_amt
-                    lic_ptr += 1
+                if total_avail >= duty:
+                    # Allocate fully from matching licenses sequentially
+                    duty_remaining = duty
+                    for lic in lics:
+                        if duty_remaining <= 0.005:
+                            break
+                        if str(lic['type']).strip().upper() != lic_type:
+                            continue
+                        max_debitable = lic['bal'] - 1.00
+                        if max_debitable <= 0.01:
+                            continue
+                            
+                        if max_debitable >= duty_remaining:
+                            debit_amt = duty_remaining
+                            lic['bal'] -= debit_amt
+                            license_debit_totals[lic['lic_no']] += debit_amt
+                            duty_remaining = 0.0
+                        else:
+                            debit_amt = max_debitable
+                            lic['bal'] = 1.00
+                            license_debit_totals[lic['lic_no']] += debit_amt
+                            duty_remaining -= debit_amt
+                    break # Covered item, stop trying other types
                     
         total_estimated_debit = sum(license_debit_totals.values())
         return total_estimated_debit, license_debit_totals
@@ -1066,7 +1061,7 @@ class LicenseAutomationApp:
         self.run_btn.config(state='disabled')
         self.log("Starting analysis of files in background thread...")
         
-        scheme_dropdown_val = self.scheme_selection.get()
+        scheme_dropdown_val = "Auto-Detect"
         
         threading.Thread(
             target=self._load_and_analyze_worker,
@@ -1127,7 +1122,7 @@ class LicenseAutomationApp:
             
             wb_jd.close()
             
-            # Match each item from the report to check for Exim_Code 14
+            # Match each item from the report to check for Exim_Code 14 and store scheme
             item_duties = []
             restricted_count = 0
             for idx, r_row in df_rep.iterrows():
@@ -1135,6 +1130,9 @@ class LicenseAutomationApp:
                 rep_desc = str(r_row['Product Desc']).strip()
                 rep_qty = safe_float(r_row['Quantity'])
                 rep_cth = str(r_row['CTH']).strip()
+                rep_scheme = str(r_row['Exim Scheme Code']).strip().upper() if not pd.isna(r_row['Exim Scheme Code']) else "RD"
+                if rep_scheme in ('NAN', ''):
+                    rep_scheme = "RD"
                 
                 av = safe_float(r_row['Assessable Value (INR)'])
                 rate = safe_float(r_row['Basic Duty Rate'])
@@ -1164,9 +1162,9 @@ class LicenseAutomationApp:
                 else:
                     duty = round(av * rate / 100.0, 2)
                     
-                item_duties.append(duty)
+                item_duties.append({'duty': duty, 'scheme': rep_scheme})
             
-            required_duty = round(sum(item_duties), 2)
+            required_duty = round(sum(d['duty'] for d in item_duties), 2)
             
             raw_be_no = df_rep.loc[0, 'BE No']
             be_no = str(raw_be_no).strip() if not pd.isna(raw_be_no) else "nan"
@@ -1246,38 +1244,35 @@ class LicenseAutomationApp:
             val_idx = header_scrip.index('VALUE')
             date_idx = header_scrip.index('LIC DATE')
             
-            mapped_lic_type = "RODTEP" if scheme_code.upper() == "RD" else scheme_code.upper()
-            
             active_licenses = []
             for idx, r in enumerate(scrip_rows[1:], start=2):
                 if len(r) <= max(lic_idx, bal_idx, port_idx, type_idx, exp_idx) or r[lic_idx] is None:
                     continue
                 lic_type = str(r[type_idx]).strip().upper() if r[type_idx] is not None else ""
                 
-                if mapped_lic_type in lic_type:
-                    bal = r[bal_idx]
-                    if bal is not None:
-                        try:
-                            bal_f = safe_float(bal)
-                            if bal_f > 0.00:
-                                exp_val = r[exp_idx]
-                                exp_date = self.parse_sheet_date(exp_val)
-                                reg_date_val = r[date_idx]
-                                reg_date = self.parse_sheet_date(reg_date_val)
-                                
-                                active_licenses.append({
-                                    'lic_no': str(r[lic_idx]).split('.')[0].strip(),
-                                    'port': str(r[port_idx]).strip(),
-                                    'type': str(r[type_idx]).strip(),
-                                    'val': safe_float(r[val_idx]),
-                                    'bal': bal_f,
-                                    'expiry': exp_date,
-                                    'reg_date': reg_date
-                                })
-                        except ValueError:
-                            pass
+                bal = r[bal_idx]
+                if bal is not None:
+                    try:
+                        bal_f = safe_float(bal)
+                        if bal_f > 0.00:
+                            exp_val = r[exp_idx]
+                            exp_date = self.parse_sheet_date(exp_val)
+                            reg_date_val = r[date_idx]
+                            reg_date = self.parse_sheet_date(reg_date_val)
+                            
+                            active_licenses.append({
+                                'lic_no': str(r[lic_idx]).split('.')[0].strip(),
+                                'port': str(r[port_idx]).strip(),
+                                'type': str(r[type_idx]).strip(),
+                                'val': safe_float(r[val_idx]),
+                                'bal': bal_f,
+                                'expiry': exp_date,
+                                'reg_date': reg_date
+                            })
+                    except ValueError:
+                        pass
             
-            self.safe_log(f"Successfully loaded {len(active_licenses)} active {mapped_lic_type} licenses.")
+            self.safe_log(f"Successfully loaded {len(active_licenses)} active licenses.")
             self.root.after(0, lambda: self._load_and_analyze_success(job_info, active_licenses, required_duty, item_duties))
             
         except Exception as e:
@@ -1470,9 +1465,14 @@ class LicenseAutomationApp:
             exim_notn_sr_idx = items_header.index('Exim_NotnSrNo') if 'Exim_NotnSrNo' in items_header else -1
             
             self.safe_log("Running allocation algorithm...")
-            lic_ptr = 0
             job_license_rows = []
             license_debit_totals = {lic['lic_no']: 0.0 for lic in selected_lics}
+            
+            candidate_types = []
+            for lic in selected_lics:
+                t = str(lic['type']).strip().upper()
+                if t not in candidate_types:
+                    candidate_types.append(t)
             
             for idx, r_row in df_rep.iterrows():
                 rep_inv_no = str(r_row['Invoice No']).strip()
@@ -1517,17 +1517,17 @@ class LicenseAutomationApp:
                 duty = round(av * rate / 100.0, 2)
                 
                 if duty == 0.0:
-                    if lic_ptr < len(selected_lics):
-                        curr_lic = selected_lics[lic_ptr]
+                    matching_lic = selected_lics[0] if len(selected_lics) > 0 else None
+                    if matching_lic:
                         job_license_rows.append({
                             'Inv_SrNo': inv_sr,
                             'Item_SrNo': item_sr,
                             'Invoice_No': rep_inv_no,
-                            'License_No': curr_lic['lic_no'],
-                            'License_Date': curr_lic['reg_date'].strftime('%d-%b-%Y') if curr_lic['reg_date'] else "",
-                            'License_RegNo': curr_lic['lic_no'],
-                            'License_RegDate': curr_lic['reg_date'].strftime('%d-%b-%Y') if curr_lic['reg_date'] else "",
-                            'Reg_Port': curr_lic['port'],
+                            'License_No': matching_lic['lic_no'],
+                            'License_Date': matching_lic['reg_date'].strftime('%d-%b-%Y') if matching_lic['reg_date'] else "",
+                            'License_RegNo': matching_lic['lic_no'],
+                            'License_RegDate': matching_lic['reg_date'].strftime('%d-%b-%Y') if matching_lic['reg_date'] else "",
+                            'Reg_Port': matching_lic['port'],
                             'CIF_Value': av,
                             'DebitDeutyValue': 0.00,
                             'DebitQuantity': rep_qty,
@@ -1538,7 +1538,7 @@ class LicenseAutomationApp:
                             'Basic_Duty_Value': 0.00
                         })
                         # Update exim values based on license type
-                        lic_type = str(curr_lic['type']).strip().upper()
+                        lic_type = str(matching_lic['type']).strip().upper()
                         if 'ROSCTL' in lic_type:
                             exim_code_val = 'RS'
                             exim_notn_val = 'ROSCTL'
@@ -1573,40 +1573,44 @@ class LicenseAutomationApp:
                                 ws_items.cell(row=matched_row_idx, column=exim_notn_sr_idx + 1, value=exim_notn_sr_val)
                     continue
 
-                # Check total available balance of all selected licenses starting from current pointer
-                total_avail = sum(max(0.0, selected_lics[i]['bal'] - 1.00) for i in range(lic_ptr, len(selected_lics)))
-                
-                # If we don't have enough total balance to cover this item's duty fully, skip it (pay cash)
-                if total_avail < duty:
-                    self.safe_log(f"Skipping item {idx+1} (Duty: {duty:.2f} INR) - Insufficient remaining license balance to cover it fully to 0.")
+                # Find which type can cover this item's duty fully
+                allocated_type = None
+                for lic_type in candidate_types:
+                    matching_lics = [lic for lic in selected_lics if str(lic['type']).strip().upper() == lic_type]
+                    total_avail = sum(max(0.0, lic['bal'] - 1.00) for lic in matching_lics)
+                    if total_avail >= duty:
+                        allocated_type = lic_type
+                        break
+                        
+                if not allocated_type:
+                    self.safe_log(f"Skipping item {idx+1} (Duty: {duty:.2f} INR) - Insufficient remaining balance in any single license type to cover it fully to 0.")
                     continue
 
                 duty_remaining = duty
-                while duty_remaining > 0:
-                    if lic_ptr >= len(selected_lics):
+                last_used_lic = None
+                for lic in selected_lics:
+                    if duty_remaining <= 0.005:
                         break
-                        
-                    curr_lic = selected_lics[lic_ptr]
-                    max_debitable = curr_lic['bal'] - 1.00
+                    if str(lic['type']).strip().upper() != allocated_type:
+                        continue
+                    max_debitable = lic['bal'] - 1.00
                     if max_debitable <= 0.01:
-                        lic_ptr += 1
-                        if lic_ptr < len(selected_lics):
-                            self.safe_log(f"License depleted or insufficient (below 1.00 balance). Switching to License: {selected_lics[lic_ptr]['lic_no']}")
                         continue
                         
+                    last_used_lic = lic
                     if max_debitable >= duty_remaining:
                         debit_amt = duty_remaining
-                        curr_lic['bal'] -= debit_amt
+                        lic['bal'] -= debit_amt
                         ratio = debit_amt / duty
                         job_license_rows.append({
                             'Inv_SrNo': inv_sr,
                             'Item_SrNo': item_sr,
                             'Invoice_No': rep_inv_no,
-                            'License_No': curr_lic['lic_no'],
-                            'License_Date': curr_lic['reg_date'].strftime('%d-%b-%Y') if curr_lic['reg_date'] else "",
-                            'License_RegNo': curr_lic['lic_no'],
-                            'License_RegDate': curr_lic['reg_date'].strftime('%d-%b-%Y') if curr_lic['reg_date'] else "",
-                            'Reg_Port': curr_lic['port'],
+                            'License_No': lic['lic_no'],
+                            'License_Date': lic['reg_date'].strftime('%d-%b-%Y') if lic['reg_date'] else "",
+                            'License_RegNo': lic['lic_no'],
+                            'License_RegDate': lic['reg_date'].strftime('%d-%b-%Y') if lic['reg_date'] else "",
+                            'Reg_Port': lic['port'],
                             'CIF_Value': av,
                             'DebitDeutyValue': round(debit_amt, 2),
                             'DebitQuantity': round(rep_qty * ratio, 3),
@@ -1616,21 +1620,21 @@ class LicenseAutomationApp:
                             'Basic_Duty_Rate': rate,
                             'Basic_Duty_Value': duty
                         })
-                        license_debit_totals[curr_lic['lic_no']] += debit_amt
+                        license_debit_totals[lic['lic_no']] += debit_amt
                         duty_remaining = 0
                     else:
                         debit_amt = max_debitable
-                        curr_lic['bal'] = 1.00
+                        lic['bal'] = 1.00
                         ratio = debit_amt / duty
                         job_license_rows.append({
                             'Inv_SrNo': inv_sr,
                             'Item_SrNo': item_sr,
                             'Invoice_No': rep_inv_no,
-                            'License_No': curr_lic['lic_no'],
-                            'License_Date': curr_lic['reg_date'].strftime('%d-%b-%Y') if curr_lic['reg_date'] else "",
-                            'License_RegNo': curr_lic['lic_no'],
-                            'License_RegDate': curr_lic['reg_date'].strftime('%d-%b-%Y') if curr_lic['reg_date'] else "",
-                            'Reg_Port': curr_lic['port'],
+                            'License_No': lic['lic_no'],
+                            'License_Date': lic['reg_date'].strftime('%d-%b-%Y') if lic['reg_date'] else "",
+                            'License_RegNo': lic['lic_no'],
+                            'License_RegDate': lic['reg_date'].strftime('%d-%b-%Y') if lic['reg_date'] else "",
+                            'Reg_Port': lic['port'],
                             'CIF_Value': av,
                             'DebitDeutyValue': round(debit_amt, 2),
                             'DebitQuantity': round(rep_qty * ratio, 3),
@@ -1640,17 +1644,13 @@ class LicenseAutomationApp:
                             'Basic_Duty_Rate': rate,
                             'Basic_Duty_Value': duty
                         })
-                        license_debit_totals[curr_lic['lic_no']] += debit_amt
+                        license_debit_totals[lic['lic_no']] += debit_amt
                         duty_remaining -= debit_amt
                         
-                        lic_ptr += 1
-                        if lic_ptr < len(selected_lics):
-                            self.safe_log(f"License depleted (left with exactly 1.00 balance). Switching to License: {selected_lics[lic_ptr]['lic_no']}")
-                
                 # After the debiting loop for this item has processed (and if it was successfully debited),
                 # we update the EXIM columns in ws_items!
-                if duty_remaining == 0 and matched_row_idx:
-                    lic_type = str(curr_lic['type']).strip().upper()
+                if duty_remaining == 0 and last_used_lic and matched_row_idx:
+                    lic_type = str(last_used_lic['type']).strip().upper()
                     if 'ROSCTL' in lic_type:
                         exim_code_val = 'RS'
                         exim_notn_val = 'ROSCTL'
