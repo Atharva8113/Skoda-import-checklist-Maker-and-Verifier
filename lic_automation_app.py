@@ -3,11 +3,16 @@ from tkinter import ttk, messagebox, filedialog
 import os
 import re
 import json
+import zipfile
+import xml.etree.ElementTree as ET
 import requests
 import pandas as pd
 import openpyxl
 import threading
 from datetime import datetime, timedelta
+import socket
+import queue
+socket.setdefaulttimeout(35)
 
 def safe_float(val):
     if val is None:
@@ -25,6 +30,71 @@ def safe_float(val):
         return float(val_str)
     except ValueError:
         return 0.0
+
+def _quick_extract_job_no(filepath):
+    """Extract 'Job No' from cell A2 of an xlsx using raw zip+xml streaming.
+    
+    Bypasses pandas/openpyxl entirely — those hang in Tkinter background
+    threads on Windows. This uses only stdlib zipfile + iterparse,
+    is fully thread-safe, and stops after finding cell A2.
+    Returns the Job No string, or None if not found.
+    """
+    ns = 'http://schemas.openxmlformats.org/spreadsheetml/2006/main'
+    try:
+        with zipfile.ZipFile(filepath, 'r') as zf:
+            # 1. Load shared strings lookup table
+            shared = []
+            if 'xl/sharedStrings.xml' in zf.namelist():
+                for _, elem in ET.iterparse(zf.open('xl/sharedStrings.xml'), events=('end',)):
+                    if elem.tag == f'{{{ns}}}si':
+                        parts = [t.text for t in elem.iter(f'{{{ns}}}t') if t.text]
+                        shared.append(''.join(parts))
+                        elem.clear()
+            
+            # 2. Find the first worksheet xml file
+            sheet_file = None
+            for name in sorted(zf.namelist()):
+                if name.startswith('xl/worksheets/sheet') and name.endswith('.xml'):
+                    sheet_file = name
+                    break
+            if not sheet_file:
+                return None
+            
+            # 3. Stream-parse worksheet to locate cell A2
+            for _, elem in ET.iterparse(zf.open(sheet_file), events=('end',)):
+                tag = elem.tag.split('}')[-1] if '}' in elem.tag else elem.tag
+                if tag == 'c':
+                    ref = elem.get('r', '')
+                    if ref == 'A2':
+                        cell_type = elem.get('t', '')
+                        val = ''
+                        v_el = elem.find(f'{{{ns}}}v')
+                        if v_el is not None and v_el.text:
+                            if cell_type == 's':
+                                idx = int(v_el.text)
+                                val = shared[idx] if idx < len(shared) else ''
+                            else:
+                                val = v_el.text
+                        elem.clear()
+                        return val.strip() if val and val.lower() != 'nan' else None
+                    elem.clear()
+        return None
+    except Exception:
+        return None
+
+def humanize_error(raw_text):
+    raw_text = raw_text.strip()
+    if not raw_text:
+        return "Empty response received from the Google Sheet server."
+    if raw_text.startswith("<!DOCTYPE") or "<html" in raw_text.lower():
+        title_match = re.search(r"<title>(.*?)</title>", raw_text, re.IGNORECASE | re.DOTALL)
+        if title_match:
+            title = title_match.group(1).strip()
+            return f"Google Sheets Script Error: {title}\n\nPlease check your Google Sheets script configuration or URL."
+        return "Google Sheets returned an error page (HTML). This usually means the Google script crashed or the Web App URL is unauthorized/expired."
+    if len(raw_text) > 200:
+        return raw_text[:200] + "..."
+    return raw_text
 
 # --- MONKEYPATCH FOR OPENPYXL TO WRITE FORMULA CACHED VALUES ---
 from xml.etree.ElementTree import Element, SubElement
@@ -140,6 +210,9 @@ class LicenseAutomationApp:
         self.selected_duty_covered = 0.0
         self.estimated_debit = 0.0
         self.item_duties = []
+        
+        self.gui_queue = queue.Queue()
+        self.root.after(100, self.process_gui_queue)
         
         self.create_styles()
         self.build_ui()
@@ -529,6 +602,19 @@ class LicenseAutomationApp:
         )
         footer_right.pack(side='right', padx=15, pady=8)
 
+    def process_gui_queue(self):
+        """Consume callbacks in the main thread to update the GUI safely."""
+        try:
+            while True:
+                callback = self.gui_queue.get_nowait()
+                try:
+                    callback()
+                except Exception as e:
+                    self.log(f"GUI Callback Error: {e}")
+        except queue.Empty:
+            pass
+        self.root.after(100, self.process_gui_queue)
+
     def log(self, msg: str):
         """Append a message to the logging pane."""
         self.log_txt.insert(tk.END, f"[{datetime.now().strftime('%H:%M:%S')}] {msg}\n")
@@ -536,7 +622,7 @@ class LicenseAutomationApp:
 
     def safe_log(self, msg: str):
         """Append a message to the logging pane safely from any thread."""
-        self.root.after(0, lambda: self.log(msg))
+        self.gui_queue.put(lambda: self.log(msg))
 
     def save_app_config(self):
         url = self.google_sheet_url.get().strip()
@@ -599,17 +685,26 @@ class LicenseAutomationApp:
                 "action": "fetch",
                 "token": self.security_token.get().strip()
             }
-            headers = {"Content-Type": "application/json"}
+            headers = {
+                "Content-Type": "application/json",
+                "Connection": "close"
+            }
             response = requests.post(url, json=payload, headers=headers, timeout=20)
             if response.status_code != 200:
                 raise ConnectionError(f"HTTP status {response.status_code}")
                 
-            res = response.json()
+            try:
+                res = response.json()
+            except Exception:
+                raise ValueError(humanize_error(response.text))
+            finally:
+                response.close()
+                
             if not res.get("success"):
                 raise ValueError(res.get("error", "Unknown Error"))
                 
             data_rows = res.get("data", [])
-            self.root.after(0, lambda: self._refresh_db_view_success(data_rows))
+            self.gui_queue.put(lambda: self._refresh_db_view_success(data_rows))
         except Exception as e:
             self.safe_log(f"Failed to refresh DB view: {e}")
 
@@ -744,7 +839,7 @@ class LicenseAutomationApp:
         except Exception:
             pass
             
-        df = pd.read_excel(file_path, sheet_name=visible_sheet)
+        df = pd.read_excel(file_path, sheet_name=visible_sheet, engine='openpyxl')
         cols = [str(c).strip().upper() for c in df.columns]
         
         lic_col = -1
@@ -912,27 +1007,54 @@ class LicenseAutomationApp:
 
     def _push_licenses_worker(self, url, licenses_payload, source_type):
         try:
-            payload = {
-                "action": "add_licenses",
-                "token": self.security_token.get().strip(),
-                "licenses": licenses_payload
-            }
-            headers = {"Content-Type": "application/json"}
-            response = requests.post(url, json=payload, headers=headers, timeout=30)
-            if response.status_code != 200:
-                raise ConnectionError(f"HTTP status {response.status_code}")
+            to_push = licenses_payload
+            self.safe_log(f"Pushing {len(to_push)} licenses to Google Sheets cloud (one-by-one check)...")
+            success_count = 0
+            error_details = []
+            
+            for idx, l in enumerate(to_push, start=1):
+                lic_no = l['lic_no']
+                self.safe_log(f"[{idx}/{len(to_push)}] Pushing license {lic_no}...")
                 
-            res = response.json()
-            if not res.get("success"):
-                raise ValueError(res.get("error", "Unknown Error"))
+                payload = {
+                    "action": "add_licenses",
+                    "token": self.security_token.get().strip(),
+                    "licenses": [l]
+                }
+                headers = {
+                    "Content-Type": "application/json",
+                    "Connection": "close"
+                }
                 
-            self.safe_log(f"Successfully pushed {len(licenses_payload)} licenses to Google Sheets.")
-            self.root.after(0, lambda: self._push_licenses_success(source_type))
+                try:
+                    response = requests.post(url, json=payload, headers=headers, timeout=20)
+                    if response.status_code != 200:
+                        raise ConnectionError(f"HTTP status {response.status_code}")
+                    
+                    try:
+                        res = response.json()
+                    except Exception:
+                        raise ValueError(humanize_error(response.text))
+                    finally:
+                        response.close()
+                    
+                    if not res.get("success"):
+                        raise ValueError(res.get("error", "Unknown Error"))
+                        
+                    success_count += 1
+                except Exception as e:
+                    self.safe_log(f"License {lic_no} failed validation: {e}")
+                    error_details.append((lic_no, str(e)))
+            
+            self.safe_log(f"Pusher finished: {success_count} added successfully, {len(error_details)} skipped/failed.")
+            self.gui_queue.put(lambda: self._push_licenses_success(source_type, success_count, 0, error_details))
+            
         except Exception as e:
-            self.safe_log(f"Failed to push licenses: {e}")
-            self.root.after(0, lambda: self._push_licenses_failure(str(e)))
+            err_msg = str(e)
+            self.safe_log(f"Critical error during license push: {err_msg}")
+            self.gui_queue.put(lambda: self._push_licenses_failure(err_msg))
 
-    def _push_licenses_success(self, source_type):
+    def _push_licenses_success(self, source_type, success_count, skipped_active_count, error_details):
         self.paste_btn.config(state='normal')
         self.excel_btn.config(state='normal')
         self.root.config(cursor="")
@@ -942,7 +1064,23 @@ class LicenseAutomationApp:
         else:
             self.new_lic_excel_path.set("")
             
-        messagebox.showinfo("Success", "Licenses added successfully to the central cloud database!")
+        summary_msg = f"Upload process completed:\n\n"
+        summary_msg += f"✅ Successfully added: {success_count} new license(s)\n"
+        if skipped_active_count > 0:
+            summary_msg += f"ℹ️ Skipped (already active in Data sheet): {skipped_active_count} license(s)\n"
+        if error_details:
+            summary_msg += f"❌ Skipped/Failed (cloud validation error): {len(error_details)} license(s)\n\n"
+            summary_msg += "Validation details:\n"
+            for lic_no, err in error_details[:5]:
+                # Extract clean error description if it's long
+                clean_err = str(err)
+                if "Google Sheets Script Error" in clean_err:
+                    clean_err = clean_err.split("\n")[0]
+                summary_msg += f" - Lic {lic_no}: {clean_err}\n"
+            if len(error_details) > 5:
+                summary_msg += f" - ... and {len(error_details) - 5} more."
+                
+        messagebox.showinfo("Upload Summary", summary_msg)
         self.refresh_db_view()
 
     def _push_licenses_failure(self, error_msg):
@@ -1097,8 +1235,36 @@ class LicenseAutomationApp:
 
     def _load_and_analyze_worker(self, jd_path, ir_path, scheme_dropdown_val):
         try:
+            self.safe_log("Pre-validating Item Report and JobData files...")
+            
+            # 1. Ultra-fast pre-check: read Job No directly from xlsx zip (no pandas/openpyxl)
+            report_job_no = _quick_extract_job_no(ir_path)
+            if report_job_no is None:
+                raise ValueError("The selected file is not a valid Item Report (missing 'Job No' column or data).")
+                
+            # 2. Extract job number from JobData filename
+            jd_filename = os.path.basename(jd_path)
+            jd_clean = jd_filename
+            if jd_clean.lower().startswith("jobdata_"):
+                jd_clean = jd_clean[8:]
+            jd_clean = re.sub(r'_\d{8}_\d{6}\.xlsx$', '', jd_clean, flags=re.IGNORECASE)
+            jd_clean = re.sub(r'\.xlsx$', '', jd_clean, flags=re.IGNORECASE)
+            
+            # Normalize both
+            norm_report = re.sub(r'[^a-zA-Z0-9]', '', report_job_no).upper()
+            norm_filename = re.sub(r'[^a-zA-Z0-9]', '', jd_clean).upper()
+            
+            if norm_report != norm_filename:
+                raise ValueError(
+                    f"File Mismatch Error!\n\n"
+                    f"The selected JobData Excel file does not match the loaded Item Report.\n\n"
+                    f"• Item Report Job No: {report_job_no}\n"
+                    f"• JobData Excel File: {jd_filename}\n\n"
+                    f"Please load matching files for the same Job."
+                )
+                
             self.safe_log("Reading Import Item Report...")
-            df_rep = pd.read_excel(ir_path)
+            df_rep = pd.read_excel(ir_path, engine='openpyxl')
             
             cols = df_rep.columns.tolist()
             req_cols = ['BE No', 'BE Date', 'Job No', 'Assessable Value (INR)', 'Basic Duty Rate', 'Exim Scheme Code', 'Quantity', 'Unit', 'Product Desc']
@@ -1160,6 +1326,8 @@ class LicenseAutomationApp:
             # Match each item from the report to check for Exim_Code 14 and store scheme
             item_duties = []
             restricted_count = 0
+            matched_rows = set()
+            
             for idx, r_row in df_rep.iterrows():
                 rep_inv_no = str(r_row['Invoice No']).strip()
                 rep_desc = str(r_row['Product Desc']).strip()
@@ -1178,11 +1346,14 @@ class LicenseAutomationApp:
                 if inv_sr and exim_code_idx != -1:
                     candidates = items_by_inv_sr.get(inv_sr, [])
                     for r_idx, item_row in candidates:
+                        if r_idx in matched_rows:
+                            continue
                         itm_desc = str(item_row[desc_idx]).strip() if item_row[desc_idx] is not None else ""
                         itm_qty = safe_float(item_row[qty_idx])
                         itm_cth = str(item_row[cth_idx]).strip() if item_row[cth_idx] is not None else ""
                         
                         if itm_desc == rep_desc and abs(itm_qty - rep_qty) < 0.01 and itm_cth == rep_cth:
+                            matched_rows.add(r_idx)
                             exim_code_val = str(item_row[exim_code_idx]).strip()
                             if exim_code_val == '14' or exim_code_val == '14.0':
                                 is_restricted = True
@@ -1249,7 +1420,10 @@ class LicenseAutomationApp:
                 raise ValueError("Google Web App URL is not configured. Please set it in the Database Master tab.")
                 
             self.safe_log("Loading active licenses from Google Sheets cloud...")
-            headers = {"Content-Type": "application/json"}
+            headers = {
+                "Content-Type": "application/json",
+                "Connection": "close"
+            }
             payload = {
                 "action": "fetch",
                 "token": self.security_token.get().strip()
@@ -1258,9 +1432,33 @@ class LicenseAutomationApp:
             if response.status_code != 200:
                 raise ConnectionError(f"Cloud request failed with status: {response.status_code}")
                 
-            res_data = response.json()
+            try:
+                res_data = response.json()
+            except Exception:
+                raise ValueError(humanize_error(response.text))
+            finally:
+                response.close()
+                
             if not res_data.get("success"):
                 raise ValueError(f"Cloud DB returned error: {res_data.get('error', 'Unknown Error')}")
+                
+            # Extract already debited job numbers from the cloud ledger
+            debited_jobs = set()
+            boe_rows = res_data.get("boe", [])
+            if len(boe_rows) > 1:
+                header_boe = [str(h).strip().upper() for h in boe_rows[0]]
+                if 'LIC USED IN THE JOB' in header_boe:
+                    job_idx_boe = header_boe.index('LIC USED IN THE JOB')
+                    for row in boe_rows[1:]:
+                        if len(row) > job_idx_boe and row[job_idx_boe]:
+                            debited_jobs.add(str(row[job_idx_boe]).strip().upper())
+            
+            if report_job_no.upper() in debited_jobs:
+                raise ValueError(
+                    f"Duplicate Debit Protection!\n\n"
+                    f"Job '{report_job_no}' has ALREADY been debited in the cloud database ledger.\n\n"
+                    f"License allocation for this job is blocked to prevent duplicate debiting."
+                )
                 
             scrip_rows = res_data.get("data", [])
             if not scrip_rows or len(scrip_rows) < 2:
@@ -1306,10 +1504,11 @@ class LicenseAutomationApp:
                         pass
             
             self.safe_log(f"Successfully loaded {len(active_licenses)} active licenses.")
-            self.root.after(0, lambda: self._load_and_analyze_success(job_info, active_licenses, required_duty, item_duties))
+            self.gui_queue.put(lambda: self._load_and_analyze_success(job_info, active_licenses, required_duty, item_duties))
             
         except Exception as e:
-            self.root.after(0, lambda: self._load_and_analyze_failure(str(e)))
+            err_msg = str(e)
+            self.gui_queue.put(lambda: self._load_and_analyze_failure(err_msg))
 
     def _load_and_analyze_success(self, job_info, active_licenses, required_duty, item_duties):
         self.job_info = job_info
@@ -1330,7 +1529,20 @@ class LicenseAutomationApp:
         self.load_btn.config(state='normal')
         self.run_btn.config(state='disabled')
         self.log(f"Error during analysis: {error_msg}")
-        messagebox.showerror("Error", f"Failed to analyze files: {error_msg}")
+        
+        # Clear inputs specifically for Mismatch and Duplicate Debit errors
+        is_mismatch = "File Mismatch Error" in error_msg
+        is_duplicate_debit = "Duplicate Debit Protection" in error_msg
+        if is_mismatch or is_duplicate_debit:
+            self.job_data_path.set("")
+            self.item_report_path.set("")
+            # Reset summary panel to default placeholder
+            for widget in self.summary_text_frame.winfo_children():
+                widget.destroy()
+            ttk.Label(self.summary_text_frame, text="Please load the JobData and Item Report files to view summary.", style='Summary.TLabel').pack(anchor='w', pady=10)
+            self.log("JobData and Item Report paths cleared due to verification error.")
+            
+        messagebox.showerror("Error", f"Failed to analyze files:\n\n{error_msg}", parent=self.root)
 
     def populate_license_table(self):
         """Fill treeview table and auto-check the licenses that will actually be utilized, retaining database order."""
@@ -1448,7 +1660,7 @@ class LicenseAutomationApp:
                         break
             
             self.safe_log("Reading Import Item Report...")
-            df_rep = pd.read_excel(ir_path)
+            df_rep = pd.read_excel(ir_path, engine='openpyxl')
             
             self.safe_log("Opening JobData Excel for writing (preserving formulas)...")
             wb_jd = openpyxl.load_workbook(jd_path, data_only=False)
@@ -1475,6 +1687,7 @@ class LicenseAutomationApp:
             exim_code_idx = items_header.index('Exim_Code') if 'Exim_Code' in items_header else -1
             exim_notn_idx = items_header.index('Exim_Notn') if 'Exim_Notn' in items_header else -1
             exim_notn_sr_idx = items_header.index('Exim_NotnSrNo') if 'Exim_NotnSrNo' in items_header else -1
+            duty_exemption_idx = items_header.index('DUTY_ExemptionType') if 'DUTY_ExemptionType' in items_header else -1
             
             self.safe_log("Running allocation algorithm...")
             job_license_rows = []
@@ -1489,6 +1702,7 @@ class LicenseAutomationApp:
                         items_by_inv_sr[itm_inv_sr] = []
                     items_by_inv_sr[itm_inv_sr].append((r_idx, item_row))
             
+            matched_rows = set()
             
             for idx, r_row in df_rep.iterrows():
                 rep_inv_no = str(r_row['Invoice No']).strip()
@@ -1507,6 +1721,8 @@ class LicenseAutomationApp:
                 if inv_sr:
                     candidates = items_by_inv_sr.get(inv_sr, [])
                     for r_idx, item_row in candidates:
+                        if r_idx in matched_rows:
+                            continue
                         itm_desc = str(item_row[desc_idx]).strip() if item_row[desc_idx] is not None else ""
                         itm_qty = safe_float(item_row[qty_idx])
                         itm_cth = str(item_row[cth_idx]).strip() if item_row[cth_idx] is not None else ""
@@ -1514,6 +1730,7 @@ class LicenseAutomationApp:
                         if itm_desc == rep_desc and abs(itm_qty - rep_qty) < 0.01 and itm_cth == rep_cth:
                             item_sr = str(item_row[item_sr_idx]).strip()
                             matched_row_idx = r_idx
+                            matched_rows.add(r_idx)
                             if exim_code_idx != -1:
                                 exim_code_val = str(item_row[exim_code_idx]).strip()
                                 if exim_code_val == '14' or exim_code_val == '14.0':
@@ -1585,6 +1802,8 @@ class LicenseAutomationApp:
                                 ws_items.cell(row=matched_row_idx, column=exim_notn_idx + 1, value=exim_notn_val)
                             if exim_notn_sr_idx != -1:
                                 ws_items.cell(row=matched_row_idx, column=exim_notn_sr_idx + 1, value=exim_notn_sr_val)
+                            if duty_exemption_idx != -1:
+                                ws_items.cell(row=matched_row_idx, column=duty_exemption_idx + 1, value="")
                     continue
 
                 # Find which type can cover this item by walking licenses top-to-bottom
@@ -1708,6 +1927,8 @@ class LicenseAutomationApp:
                         ws_items.cell(row=matched_row_idx, column=exim_notn_idx + 1, value=exim_notn_val)
                     if exim_notn_sr_idx != -1:
                         ws_items.cell(row=matched_row_idx, column=exim_notn_sr_idx + 1, value=exim_notn_sr_val)
+                    if duty_exemption_idx != -1:
+                        ws_items.cell(row=matched_row_idx, column=duty_exemption_idx + 1, value="")
 
             self.safe_log("Writing to JobData LICENSE sheet...")
             if 'LICENSE' not in wb_jd.sheetnames:
@@ -1774,19 +1995,30 @@ class LicenseAutomationApp:
                 "token": self.security_token.get().strip(),
                 "debits": debits_payload
             }
-            response = requests.post(url, json=payload, headers={"Content-Type": "application/json"}, timeout=30)
+            headers = {
+                "Content-Type": "application/json",
+                "Connection": "close"
+            }
+            response = requests.post(url, json=payload, headers=headers, timeout=30)
             if response.status_code != 200:
                 raise ConnectionError(f"Cloud update request failed with status: {response.status_code}")
                 
-            res_data = response.json()
+            try:
+                res_data = response.json()
+            except Exception:
+                raise ValueError(humanize_error(response.text))
+            finally:
+                response.close()
+                
             if not res_data.get("success"):
                 raise ValueError(res_data.get("error", "Unknown Error"))
                 
             self.safe_log("Google Sheets updated successfully.")
-            self.root.after(0, lambda: self._run_license_automation_success(output_jd_path))
+            self.gui_queue.put(lambda: self._run_license_automation_success(output_jd_path))
             
         except Exception as e:
-            self.root.after(0, lambda: self._run_license_automation_failure(str(e)))
+            err_msg = str(e)
+            self.gui_queue.put(lambda: self._run_license_automation_failure(err_msg))
 
     def _run_license_automation_success(self, output_jd_path):
         self.root.config(cursor="")
@@ -1819,7 +2051,7 @@ class LicenseAutomationApp:
         self.load_btn.config(state='normal')
         self.run_btn.config(state='normal')
         self.log(f"Error executing license allocation: {error_msg}")
-        messagebox.showerror("Error", f"Failed to complete license allocation: {error_msg}")
+        messagebox.showerror("Error", f"Failed to complete license allocation:\n\n{error_msg}", parent=self.root)
 
 if __name__ == "__main__":
     root = tk.Tk()
