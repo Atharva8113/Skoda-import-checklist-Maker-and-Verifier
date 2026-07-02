@@ -1,0 +1,6 @@
+JOB NUMBER: IR/55800/26-27
+THE FOLLOWING ITEMS ARE PENDING DEBIT / REALLOCATION BECAUSE THE LICENSE BALANCE WAS TOO LOW TO COVER THEIR DUTY FULLY TO 0:
+
+No.  | InvSrNo  | ItemSrNo | Invoice No.          | Duty (INR)      | Product Description
+----------------------------------------------------------------------------------------------------
+1    | 3        | 7        | 48648787             | 93,981.40       | 4M0800411 BODY W.PAINT (AUTOMOTIVE PARTS FOR CAPTIVE CONSUMPTION)

@@ -82,6 +82,18 @@ def _quick_extract_job_no(filepath):
     except Exception:
         return None
 
+def extract_job_no_from_filename(filepath):
+    base = os.path.basename(filepath)
+    # Try to find IR_XXXXX_XX-XX
+    match = re.search(r'IR_(\d+)_(\d+-\d+)', base, re.IGNORECASE)
+    if match:
+        return f"IR/{match.group(1)}/{match.group(2)}"
+    # Try to find IR_XXXXX
+    match2 = re.search(r'IR_([a-zA-Z0-9\-]+)', base, re.IGNORECASE)
+    if match2:
+        return f"IR/{match2.group(1)}"
+    return "Unknown"
+
 def humanize_error(raw_text):
     raw_text = raw_text.strip()
     if not raw_text:
@@ -203,9 +215,24 @@ class LicenseAutomationApp:
         self.job_data_path = tk.StringVar()
         self.item_report_path = tk.StringVar()
         self.new_lic_excel_path = tk.StringVar()
+        self.rectify_jd_path = tk.StringVar()
+        self.blacklist_jd_path = tk.StringVar()
+        self.blacklist_licenses = []
+        
+        # Blacklist Tab Reallocation State
+        self.blacklist_active_lics = []
+        self.blacklist_selected_lic_nos = set()
+        self.blacklist_selected_to_blacklist = set()
+        self.blacklist_parsed_debits = []
+        self.blacklist_search_var = tk.StringVar()
+        self.blacklist_search_var.trace_add("write", lambda *args: self.populate_blacklist_select_tree())
+        self.blacklist_affected_items = []
+        self.blacklist_job_info = {}
+        self.blacklist_reallocations_preview = []
         
         self.job_info = {}
         self.active_licenses = []
+        self.used_licenses = []
         self.required_duty = 0.0
         self.selected_duty_covered = 0.0
         self.estimated_debit = 0.0
@@ -220,6 +247,7 @@ class LicenseAutomationApp:
         # Initial database view load if configured
         if self.google_sheet_url.get().strip():
             self.refresh_db_view()
+            self.refresh_blacklist()
 
     def create_styles(self):
         """Configure custom styles for ttk widgets."""
@@ -335,6 +363,16 @@ class LicenseAutomationApp:
         # Tab 2: Database Master
         tab_db = ttk.Frame(notebook)
         notebook.add(tab_db, text="Database Master")
+        
+        # Tab 3: Blacklist License
+        tab_blacklist = ttk.Frame(notebook)
+        notebook.add(tab_blacklist, text="Blacklist License")
+        self.build_blacklist_tab(tab_blacklist)
+        
+        # Tab 4: Rectify License
+        tab_rectify = ttk.Frame(notebook)
+        notebook.add(tab_rectify, text="Rectify License")
+        self.build_rectify_tab(tab_rectify)
         
         # --- TAB 1 CONTENT (LICENSE AUTOMATION) ---
         main_frame = ttk.Frame(tab_automation, padding="10")
@@ -602,6 +640,1655 @@ class LicenseAutomationApp:
         )
         footer_right.pack(side='right', padx=15, pady=8)
 
+
+    def build_blacklist_tab(self, parent):
+        """Build the layout and widgets for Tab 3: Blacklist License."""
+        main_pane = ttk.PanedWindow(parent, orient='horizontal')
+        main_pane.pack(fill='both', expand=True, padx=10, pady=10)
+        
+        # --- LEFT PANEL ---
+        left_frame = ttk.Frame(main_pane, style='Card.TFrame', padding=15)
+        main_pane.add(left_frame, weight=1)
+        
+        ttk.Label(left_frame, text="Blacklist License & Re-allocate", style='Section.TLabel').pack(anchor='w', pady=(0, 15))
+        
+        # File Picker
+        row_file = ttk.Frame(left_frame, style='Card.TFrame')
+        row_file.pack(fill='x', pady=5)
+        ttk.Label(row_file, text="Processed JobData:", width=18, anchor='w', style='Summary.TLabel').pack(side='left')
+        ttk.Entry(row_file, textvariable=self.blacklist_jd_path).pack(side='left', fill='x', expand=True, padx=5)
+        ttk.Button(row_file, text="Browse", command=self.browse_blacklist_jd).pack(side='left')
+        
+        # Parse Button
+        self.blacklist_parse_btn = ttk.Button(left_frame, text="PARSE DEBITED LICENSES", command=self.parse_blacklist_jd)
+        self.blacklist_parse_btn.pack(fill='x', pady=10)
+        
+        # Scrollable Treeview for selecting multiple licenses to blacklist
+        row_lic = ttk.Frame(left_frame, style='Card.TFrame')
+        row_lic.pack(fill='both', expand=True, pady=5)
+        ttk.Label(row_lic, text="Select Licenses to Blacklist:", style='Summary.TLabel').pack(anchor='w', pady=(0, 5))
+        
+        # Searchbar and Dropdown Checker Frame
+        search_filter_frame = ttk.Frame(row_lic, style='Card.TFrame')
+        search_filter_frame.pack(fill='x', pady=(0, 5))
+        
+        ttk.Label(search_filter_frame, text="Search:", style='Summary.TLabel').pack(side='left', padx=(0, 5))
+        search_entry = ttk.Entry(search_filter_frame, textvariable=self.blacklist_search_var, width=15)
+        search_entry.pack(side='left', fill='x', expand=True, padx=(0, 10))
+        
+        self.blacklist_dropdown_checker = ttk.Combobox(
+            search_filter_frame, 
+            values=["Check All", "Uncheck All"], 
+            state='readonly', 
+            width=15
+        )
+        self.blacklist_dropdown_checker.set("[Select All/None]")
+        self.blacklist_dropdown_checker.pack(side='right', padx=(5, 0))
+        self.blacklist_dropdown_checker.bind("<<ComboboxSelected>>", self.on_blacklist_dropdown_checker_changed)
+        
+        tree_frame = ttk.Frame(row_lic)
+        tree_frame.pack(fill='both', expand=True)
+        
+        self.blacklist_select_tree = ttk.Treeview(
+            tree_frame, 
+            columns=('Select', 'LicenseNo', 'Type', 'Port'), 
+            show='headings', 
+            height=3
+        )
+        self.blacklist_select_tree.heading('Select', text='[Select]')
+        self.blacklist_select_tree.heading('LicenseNo', text='License No.')
+        self.blacklist_select_tree.heading('Type', text='Type')
+        self.blacklist_select_tree.heading('Port', text='Port')
+        
+        self.blacklist_select_tree.column('Select', width=65, anchor='center')
+        self.blacklist_select_tree.column('LicenseNo', width=130, anchor='center')
+        self.blacklist_select_tree.column('Type', width=90, anchor='center')
+        self.blacklist_select_tree.column('Port', width=90, anchor='center')
+        
+        scroll = ttk.Scrollbar(tree_frame, orient='vertical', command=self.blacklist_select_tree.yview)
+        self.blacklist_select_tree.configure(yscrollcommand=scroll.set)
+        
+        self.blacklist_select_tree.pack(side='left', fill='both', expand=True)
+        scroll.pack(side='right', fill='y')
+        
+        self.blacklist_select_tree.bind('<ButtonRelease-1>', self.on_blacklist_select_tree_click)
+        self.blacklist_select_tree.tag_configure('checked', background="#E8F5E9")
+        
+        # Reason Entry
+        row_reason = ttk.Frame(left_frame, style='Card.TFrame')
+        row_reason.pack(fill='x', pady=10)
+        ttk.Label(row_reason, text="Reason for Blacklisting:", style='Summary.TLabel').pack(anchor='w', pady=(0, 5))
+        self.blacklist_reason_entry = ttk.Entry(row_reason)
+        self.blacklist_reason_entry.pack(fill='x')
+        
+        # Job Details Summary Preview
+        self.blacklist_preview_card = ttk.LabelFrame(left_frame, text="Job Details Summary Preview", padding=10)
+        self.blacklist_preview_card.pack(fill='both', expand=True, pady=10)
+        
+        self.blacklist_summary_lbl = ttk.Label(
+            self.blacklist_preview_card, 
+            text="Please upload processed JobData and parse to view preview.", 
+            foreground="#666666", 
+            justify='left', 
+            anchor='nw', 
+            font=(FONT_FAMILY, 10)
+        )
+        self.blacklist_summary_lbl.pack(fill='both', expand=True)
+        
+        # Action Button
+        self.blacklist_execute_btn = ttk.Button(
+            left_frame, 
+            text="BLACKLIST & RE-ALLOCATE DEBITS", 
+            command=self.run_blacklist_reallocation, 
+            state='disabled', 
+            style='Action.TButton'
+        )
+        self.blacklist_execute_btn.pack(fill='x', pady=(10, 0))
+        
+        # --- RIGHT PANEL ---
+        right_frame = ttk.Frame(main_pane, style='Card.TFrame', padding=15)
+        main_pane.add(right_frame, weight=2)
+        
+        # Card 1: Active Licenses Table for Reallocation
+        ttk.Label(right_frame, text="Active Licenses (Eligible for Re-allocation)", style='Section.TLabel').pack(anchor='w', pady=(0, 5))
+        ttk.Label(right_frame, text="Check/uncheck to select licenses to be used for reallocation.", font=(FONT_FAMILY, 9, 'italic'), foreground="#666666").pack(anchor='w', pady=(0, 10))
+        
+        self.blacklist_lic_tree_frame = ttk.Frame(right_frame)
+        self.blacklist_lic_tree_frame.pack(fill='both', expand=True, pady=(0, 10))
+        
+        scroll_y = ttk.Scrollbar(self.blacklist_lic_tree_frame, orient='vertical')
+        scroll_y.pack(side='right', fill='y')
+        scroll_x = ttk.Scrollbar(self.blacklist_lic_tree_frame, orient='horizontal')
+        scroll_x.pack(side='bottom', fill='x')
+        
+        self.blacklist_lic_tree = ttk.Treeview(
+            self.blacklist_lic_tree_frame,
+            columns=('selected', 'lic_no', 'port', 'type', 'balance', 'expiry'),
+            show='headings',
+            yscrollcommand=scroll_y.set,
+            xscrollcommand=scroll_x.set,
+            selectmode='none',
+            height=6
+        )
+        self.blacklist_lic_tree.pack(fill='both', expand=True)
+        scroll_y.config(command=self.blacklist_lic_tree.yview)
+        scroll_x.config(command=self.blacklist_lic_tree.xview)
+        
+        self.blacklist_lic_tree.heading('selected', text="[Select]")
+        self.blacklist_lic_tree.heading('lic_no', text="License No.")
+        self.blacklist_lic_tree.heading('port', text="Port")
+        self.blacklist_lic_tree.heading('type', text="Type")
+        self.blacklist_lic_tree.heading('balance', text="Balance (INR)")
+        self.blacklist_lic_tree.heading('expiry', text="Expiry Date")
+        
+        self.blacklist_lic_tree.column('selected', width=70, anchor='center')
+        self.blacklist_lic_tree.column('lic_no', width=130, anchor='center')
+        self.blacklist_lic_tree.column('port', width=80, anchor='center')
+        self.blacklist_lic_tree.column('type', width=90, anchor='center')
+        self.blacklist_lic_tree.column('balance', width=120, anchor='e')
+        self.blacklist_lic_tree.column('expiry', width=100, anchor='center')
+        
+        self.blacklist_lic_tree.bind("<ButtonRelease-1>", self.on_blacklist_tree_click)
+        self.blacklist_lic_tree.tag_configure('checked', background="#E8F5E9")
+        
+        # Card 2: Proposed Re-allocation Preview Table
+        ttk.Label(right_frame, text="Proposed Re-allocation Details Preview", style='Section.TLabel').pack(anchor='w', pady=(10, 5))
+        
+        self.blacklist_proposed_frame = ttk.Frame(right_frame)
+        self.blacklist_proposed_frame.pack(fill='both', expand=True)
+        
+        prop_scroll_y = ttk.Scrollbar(self.blacklist_proposed_frame, orient='vertical')
+        prop_scroll_y.pack(side='right', fill='y')
+        
+        self.blacklist_proposed_tree = ttk.Treeview(
+            self.blacklist_proposed_frame,
+            columns=('inv_sr', 'item_sr', 'desc', 'duty', 'new_lic', 'port_match'),
+            show='headings',
+            yscrollcommand=prop_scroll_y.set,
+            height=7
+        )
+        self.blacklist_proposed_tree.pack(fill='both', expand=True)
+        prop_scroll_y.config(command=self.blacklist_proposed_tree.yview)
+        
+        self.blacklist_proposed_tree.heading('inv_sr', text="Inv Sr.")
+        self.blacklist_proposed_tree.heading('item_sr', text="Item Sr.")
+        self.blacklist_proposed_tree.heading('desc', text="Description")
+        self.blacklist_proposed_tree.heading('duty', text="Duty to Reallocate (INR)")
+        self.blacklist_proposed_tree.heading('new_lic', text="Reallocated License")
+        self.blacklist_proposed_tree.heading('port_match', text="Port Match?")
+        
+        self.blacklist_proposed_tree.column('inv_sr', width=60, anchor='center')
+        self.blacklist_proposed_tree.column('item_sr', width=60, anchor='center')
+        self.blacklist_proposed_tree.column('desc', width=180, anchor='w')
+        self.blacklist_proposed_tree.column('duty', width=140, anchor='e')
+        self.blacklist_proposed_tree.column('new_lic', width=130, anchor='center')
+        self.blacklist_proposed_tree.column('port_match', width=95, anchor='center')
+        
+        self.blacklist_proposed_tree.tag_configure('error', foreground=COLOR_ERROR)
+        self.blacklist_proposed_tree.tag_configure('success', foreground=COLOR_ACCENT)
+
+    def build_rectify_tab(self, parent):
+        """Build the layout and widgets for Tab 4: Rectify License."""
+        main_pane = ttk.PanedWindow(parent, orient='horizontal')
+        main_pane.pack(fill='both', expand=True, padx=10, pady=10)
+        
+        # --- LEFT SIDE: Blacklisted licenses table ---
+        left_frame = ttk.Frame(main_pane, style='Card.TFrame', padding=15)
+        main_pane.add(left_frame, weight=1)
+        
+        ttk.Label(left_frame, text="Blacklisted Licenses", style='Section.TLabel').pack(anchor='w', pady=(0, 15))
+        
+        # Treeview list
+        table_frame = ttk.Frame(left_frame)
+        table_frame.pack(fill='both', expand=True, pady=(0, 10))
+        
+        self.blacklist_tree = ttk.Treeview(table_frame, columns=('lic_no', 'date', 'reason'), show='headings', selectmode='browse')
+        self.blacklist_tree.heading('lic_no', text='License No.')
+        self.blacklist_tree.heading('date', text='Date Blacklisted')
+        self.blacklist_tree.heading('reason', text='Reason')
+        
+        self.blacklist_tree.column('lic_no', width=130, anchor='center')
+        self.blacklist_tree.column('date', width=130, anchor='center')
+        self.blacklist_tree.column('reason', width=180, anchor='w')
+        
+        scrollbar = ttk.Scrollbar(table_frame, orient='vertical', command=self.blacklist_tree.yview)
+        self.blacklist_tree.configure(yscrollcommand=scrollbar.set)
+        
+        self.blacklist_tree.pack(side='left', fill='both', expand=True)
+        scrollbar.pack(side='right', fill='y')
+        
+        self.blacklist_tree.bind('<<TreeviewSelect>>', self.on_blacklist_row_selected)
+        
+        # Refresh Button
+        ttk.Button(left_frame, text="REFRESH BLACKLIST FROM CLOUD", command=self.refresh_blacklist).pack(fill='x')
+        
+        # --- RIGHT SIDE: Rectification Editor ---
+        right_frame = ttk.Frame(main_pane, style='Card.TFrame', padding=15)
+        main_pane.add(right_frame, weight=1)
+        
+        ttk.Label(right_frame, text="Rectification Editor", style='Section.TLabel').pack(anchor='w', pady=(0, 15))
+        ttk.Label(right_frame, text="Select a blacklisted license on the left to edit and restore to active pool.", font=(FONT_FAMILY, 9, 'italic'), foreground="#666666").pack(anchor='w', pady=(0, 15))
+        
+        self.rectify_editor_frame = ttk.Frame(right_frame, style='Card.TFrame')
+        self.rectify_editor_frame.pack(fill='x', pady=10)
+        
+        grid_frame = ttk.Frame(self.rectify_editor_frame, style='Card.TFrame')
+        grid_frame.pack(fill='x')
+        
+        self.rectify_fields = {}
+        fields_config = [
+            ("License No.:", "lic_no", True),
+            ("License Date:", "date", False),
+            ("Port of Reg.:", "port", False),
+            ("Lic Type:", "type", False),
+            ("Value (INR):", "val", False),
+            ("Expiry Date:", "expiry", False)
+        ]
+        
+        for i, (label_text, key, is_ro) in enumerate(fields_config):
+            row = i // 2
+            col = (i % 2) * 2
+            
+            ttk.Label(grid_frame, text=label_text, style='Summary.TLabel').grid(row=row, column=col, sticky='w', padx=5, pady=8)
+            val_var = tk.StringVar()
+            self.rectify_fields[key] = val_var
+            
+            entry = ttk.Entry(grid_frame, textvariable=val_var, width=18)
+            if is_ro:
+                entry.config(state='readonly')
+            entry.grid(row=row, column=col+1, sticky='w', padx=5, pady=8)
+            
+        self.rectify_restore_btn = ttk.Button(right_frame, text="RECTIFY & RESTORE TO ACTIVE POOL", command=self.run_rectify_restore, state='disabled', style='Action.TButton')
+        self.rectify_restore_btn.pack(fill='x', pady=20)
+
+    def browse_blacklist_jd(self):
+        filename = filedialog.askopenfilename(title="Select Processed JobData Excel", filetypes=[("Excel Files", "*.xlsx")])
+        if filename:
+            self.blacklist_jd_path.set(filename)
+            self.parse_blacklist_jd()
+
+    def parse_blacklist_jd(self):
+        jd_path = self.blacklist_jd_path.get().strip()
+        if not jd_path:
+            messagebox.showerror("Error", "Please select a Processed JobData Excel file first.")
+            return
+        if not os.path.exists(jd_path):
+            messagebox.showerror("Error", "Selected file does not exist.")
+            return
+            
+        self.root.config(cursor="watch")
+        self.blacklist_parse_btn.config(state='disabled')
+        self.log("Parsing debited licenses from processed JobData file...")
+        
+        threading.Thread(target=self._parse_blacklist_jd_worker, args=(jd_path,), daemon=True).start()
+
+    def _parse_blacklist_jd_worker(self, jd_path):
+        try:
+            wb = openpyxl.load_workbook(jd_path, read_only=True)
+            if 'LICENSE' not in wb.sheetnames:
+                wb.close()
+                raise ValueError("This Excel file is not a processed JobData file (missing the 'LICENSE' sheet).")
+                
+            ws_lic = wb['LICENSE']
+            lics = set()
+            for r in list(ws_lic.iter_rows(values_only=True))[1:]:
+                if len(r) > 3 and r[3]:
+                    lics.add(str(r[3]).strip())
+            wb.close()
+            
+            if not lics:
+                raise ValueError("No licenses found in the 'LICENSE' sheet of this JobData file.")
+                
+            # Extract job no from filename (preferred) or GENERAL sheet
+            job_no = extract_job_no_from_filename(jd_path)
+            
+            import_port = ""
+            wb_gen = openpyxl.load_workbook(jd_path, read_only=True)
+            if 'GENERAL' in wb_gen.sheetnames:
+                ws_gen = wb_gen['GENERAL']
+                rows = list(ws_gen.iter_rows(values_only=True))
+                if len(rows) > 1:
+                    headers = [str(h).strip().upper() for h in rows[0]]
+                    if 'CUSTOMSHOUSECODE' in headers:
+                        import_port = str(rows[1][headers.index('CUSTOMSHOUSECODE')]).strip()
+            wb_gen.close()
+            
+            sorted_lics = sorted(list(lics))
+            self.gui_queue.put(lambda: self._parse_blacklist_jd_success(job_no, import_port, sorted_lics))
+            
+        except Exception as e:
+            err_msg = str(e)
+            self.gui_queue.put(lambda: self._parse_blacklist_jd_failure(err_msg))
+
+    def _parse_blacklist_jd_success(self, job_no, import_port, sorted_lics):
+        self.root.config(cursor="")
+        self.blacklist_parse_btn.config(state='normal')
+        
+        self.blacklist_job_info = {
+            'job_no': job_no,
+            'import_port': import_port
+        }
+        
+        self.blacklist_parsed_debits = []
+        self.blacklist_selected_to_blacklist.clear()
+        
+        for lic_no in sorted_lics:
+            matched = next((l for l in self.active_licenses if l['lic_no'] == lic_no), None)
+            if not matched:
+                matched = next((l for l in self.used_licenses if l['lic_no'] == lic_no), None)
+            l_port = matched['port'] if matched else "N/A"
+            l_type = matched['type'] if matched else "N/A"
+            
+            self.blacklist_parsed_debits.append({
+                'lic_no': lic_no,
+                'type': l_type,
+                'port': l_port
+            })
+            
+            pass
+            
+        # Reset search field and populate tree
+        self.blacklist_search_var.set("")
+        self.populate_blacklist_select_tree()
+        self.on_blacklist_lic_changed()
+        
+        self.log(f"Parsed {len(sorted_lics)} licenses from Job '{job_no}' successfully.")
+
+    def _parse_blacklist_jd_failure(self, error_msg):
+        self.root.config(cursor="")
+        self.blacklist_parse_btn.config(state='normal')
+        self.blacklist_execute_btn.config(state='disabled')
+        
+        self.blacklist_parsed_debits = []
+        self.blacklist_selected_to_blacklist.clear()
+        self.blacklist_search_var.set("")
+        
+        for item_id in self.blacklist_select_tree.get_children():
+            self.blacklist_select_tree.delete(item_id)
+            
+        messagebox.showerror("Error", f"Failed to parse JobData file:\n\n{error_msg}", parent=self.root)
+
+    def on_blacklist_select_tree_click(self, event):
+        item_id = self.blacklist_select_tree.identify_row(event.y)
+        if not item_id:
+            return
+            
+        values = list(self.blacklist_select_tree.item(item_id, 'values'))
+        lic_no = values[1]
+        if values[0] == "☑":
+            values[0] = "☐"
+            self.blacklist_selected_to_blacklist.discard(lic_no)
+        else:
+            values[0] = "☑"
+            self.blacklist_selected_to_blacklist.add(lic_no)
+            
+        current_tags = list(self.blacklist_select_tree.item(item_id, 'tags'))
+        if values[0] == "☑":
+            if 'checked' not in current_tags:
+                current_tags.append('checked')
+        else:
+            if 'checked' in current_tags:
+                current_tags.remove('checked')
+                
+        self.blacklist_select_tree.item(item_id, values=values, tags=tuple(current_tags))
+        self.on_blacklist_lic_changed()
+
+    def populate_blacklist_select_tree(self):
+        """Populate the select licenses to blacklist treeview with filtering."""
+        for item_id in self.blacklist_select_tree.get_children():
+            self.blacklist_select_tree.delete(item_id)
+            
+        query = self.blacklist_search_var.get().strip().lower()
+        
+        for item in self.blacklist_parsed_debits:
+            lic_no = item['lic_no']
+            l_type = item['type']
+            l_port = item['port']
+            
+            # Simple substring matching for search entry
+            if query:
+                if query not in lic_no.lower() and query not in l_type.lower() and query not in l_port.lower():
+                    continue
+                    
+            is_checked = lic_no in self.blacklist_selected_to_blacklist
+            select_str = "☑" if is_checked else "☐"
+            tags = ('checked',) if is_checked else ()
+            
+            self.blacklist_select_tree.insert(
+                '', 
+                'end', 
+                values=(select_str, lic_no, l_type, l_port),
+                tags=tags
+            )
+
+    def on_blacklist_dropdown_checker_changed(self, event):
+        """Handle Check All / Uncheck All choices from the dropdown checker on the visible rows."""
+        sel = self.blacklist_dropdown_checker.get()
+        if not sel:
+            return
+            
+        # Collect currently visible lic_no strings from the treeview
+        visible_lics = []
+        for item_id in self.blacklist_select_tree.get_children():
+            values = self.blacklist_select_tree.item(item_id, 'values')
+            visible_lics.append(values[1])
+            
+        if sel == "Check All":
+            for lic_no in visible_lics:
+                self.blacklist_selected_to_blacklist.add(lic_no)
+        elif sel == "Uncheck All":
+            for lic_no in visible_lics:
+                self.blacklist_selected_to_blacklist.discard(lic_no)
+                
+        # Reset combo value to select placeholder
+        self.blacklist_dropdown_checker.set("[Select All/None]")
+        
+        # Redraw selection treeview and trigger balance preview update
+        self.populate_blacklist_select_tree()
+        self.on_blacklist_lic_changed()
+
+    def on_blacklist_lic_changed(self):
+        jd_path = self.blacklist_jd_path.get().strip()
+        if not (self.blacklist_selected_to_blacklist and jd_path):
+            # Clear preview treeviews and label
+            for item_id in self.blacklist_lic_tree.get_children():
+                self.blacklist_lic_tree.delete(item_id)
+            for item_id in self.blacklist_proposed_tree.get_children():
+                self.blacklist_proposed_tree.delete(item_id)
+            self.blacklist_summary_lbl.config(text="Please select one or more licenses to blacklist.")
+            self.blacklist_execute_btn.config(state='disabled')
+            return
+            
+        self.root.config(cursor="watch")
+        lics_list = list(self.blacklist_selected_to_blacklist)
+        self.log(f"Loading affected items for licenses {', '.join(lics_list)}...")
+        threading.Thread(target=self._load_affected_items_worker, args=(jd_path, lics_list), daemon=True).start()
+
+    def _load_affected_items_worker(self, jd_path, lics_to_blacklist):
+        try:
+            wb_jd = openpyxl.load_workbook(jd_path, data_only=True)
+            ws_lic = wb_jd['LICENSE']
+            ws_items = wb_jd['ITEMS']
+            
+            # Read items descriptions from ITEMS sheet
+            items_rows = list(ws_items.iter_rows(values_only=True))
+            items_header = [str(h).strip() for h in items_rows[0]]
+            item_inv_sr_idx = items_header.index('InvSrNo')
+            item_sr_idx = items_header.index('ItemSrNo')
+            desc_idx = items_header.index('Product_Description')
+            cth_idx = items_header.index('CTH')
+            exim_notn_idx = -1
+            for name in ['Exim_Notn', 'Exim_Notification']:
+                if name in items_header:
+                    exim_notn_idx = items_header.index(name)
+                    break
+            
+            item_desc_map = {}
+            item_exim_notn_map = {}
+            for r in items_rows[1:]:
+                if r[item_inv_sr_idx] is not None and r[item_sr_idx] is not None:
+                    k = (str(r[item_inv_sr_idx]).strip(), str(r[item_sr_idx]).strip())
+                    item_desc_map[k] = {
+                        'desc': str(r[desc_idx]).strip() if r[desc_idx] is not None else "",
+                        'cth': str(r[cth_idx]).strip() if r[cth_idx] is not None else "",
+                    }
+                    if exim_notn_idx != -1:
+                        item_exim_notn_map[k] = str(r[exim_notn_idx]).strip().upper() if r[exim_notn_idx] is not None else ""
+            
+            # Find Invoice No mapping
+            ws_inv = wb_jd['INVOICES']
+            inv_rows = list(ws_inv.iter_rows(values_only=True))
+            inv_header = [str(h).strip() for h in inv_rows[0]]
+            inv_sr_idx = inv_header.index('InvSrNo')
+            inv_no_idx = inv_header.index('Invoice_No')
+            inv_map = {}
+            for r in inv_rows[1:]:
+                if r[inv_sr_idx] is not None and r[inv_no_idx] is not None:
+                    inv_map[str(r[inv_sr_idx]).strip()] = str(r[inv_no_idx]).strip()
+            
+            # Collect debits of the licenses to blacklist
+            lic_rows_raw = list(ws_lic.iter_rows(values_only=True))
+            
+            # Calculate total duty and quantity of each item across all its allocations in the LICENSE sheet
+            item_total_duty_map = {}
+            item_total_qty_map = {}
+            for row in lic_rows_raw[1:]:
+                if len(row) > 11 and row[0] is not None and row[1] is not None:
+                    inv_sr_val = str(row[0]).strip()
+                    item_sr_val = str(row[1]).strip()
+                    key_val = (inv_sr_val, item_sr_val)
+                    item_total_duty_map[key_val] = item_total_duty_map.get(key_val, 0.0) + safe_float(row[10])
+                    item_total_qty_map[key_val] = item_total_qty_map.get(key_val, 0.0) + safe_float(row[11])
+
+            affected_items = []
+            lics_set = set(lics_to_blacklist)
+            
+            for row in lic_rows_raw[1:]:
+                if len(row) > 3 and row[3]:
+                    lic_num = str(row[3]).strip()
+                    if lic_num in lics_set:
+                        inv_sr = str(row[0]).strip()
+                        item_sr = str(row[1]).strip()
+                        k = (inv_sr, item_sr)
+                        desc_info = item_desc_map.get(k, {'desc': '', 'cth': ''})
+                        
+                        affected_items.append({
+                            'Inv_SrNo': inv_sr,
+                            'Item_SrNo': item_sr,
+                            'Invoice_No': inv_map.get(inv_sr, f"Inv-{inv_sr}"),
+                            'License_No': lic_num,
+                            'License_Date': row[4],
+                            'License_RegNo': row[5],
+                            'License_RegDate': row[6],
+                            'Reg_Port': row[7],
+                            'CIF_Value': safe_float(row[9]),
+                            'DebitDeutyValue': safe_float(row[10]),
+                            'DebitQuantity': safe_float(row[11]),
+                            'DebitQuantityUnitCode': row[12] if len(row) > 12 else "",
+                            'Product_Desc': desc_info['desc'],
+                            'CTH': desc_info['cth'],
+                            'Total_Item_Duty': item_total_duty_map.get(k, 0.0),
+                            'Total_Item_Qty': item_total_qty_map.get(k, 0.0)
+                        })
+            
+            wb_jd.close()
+            
+            # Determine the type of the blacklisted license
+            lic_type = "RODTEP" # Fallback
+            for alloc in affected_items:
+                k = (alloc['Inv_SrNo'], alloc['Item_SrNo'])
+                notn = item_exim_notn_map.get(k, "")
+                allowed = "RODTEP"
+                if 'ROSCTL' in notn:
+                    allowed = "ROSCTL"
+                    lic_type = "ROSCTL"
+                elif 'DFIA' in notn:
+                    allowed = "DFIA"
+                    lic_type = "DFIA"
+                elif 'EPCG' in notn:
+                    allowed = "EPCG"
+                    lic_type = "EPCG"
+                elif 'ADVANCE' in notn or 'ADV' in notn or 'AA' in notn:
+                    allowed = "ADVANCE"
+                    lic_type = "ADVANCE"
+                alloc['Allowed_Type'] = allowed
+            
+            self.gui_queue.put(lambda: self._load_affected_items_success(affected_items, lic_type))
+        except Exception as e:
+            err_msg = str(e)
+            self.gui_queue.put(lambda: self._load_affected_items_failure(err_msg))
+
+    def _load_affected_items_success(self, affected_items, lic_type):
+        self.root.config(cursor="")
+        self.blacklist_affected_items = affected_items
+        self.blacklist_job_info['lic_type'] = lic_type
+        
+        # Populate all active licenses except the blacklisted ones (allows multiple types)
+        active_lics = []
+        for l in self.active_licenses:
+            if l.get('lic_no') in self.blacklist_selected_to_blacklist:
+                continue
+            active_lics.append(l)
+            
+        self.blacklist_active_lics = active_lics
+        
+        # Run simulation to see which licenses are actually needed to cover reallocation duty
+        # Each item duty must be fully covered by a single type, trying types in top-to-bottom order.
+        for l in active_lics:
+            l['sim_bal'] = l['bal']
+            l['sim_used'] = False
+            
+        for alloc in affected_items:
+            duty = alloc['DebitDeutyValue']
+            if duty <= 0:
+                if active_lics:
+                    active_lics[0]['sim_used'] = True
+                continue
+                
+            allocated_type = None
+            tried_types = set()
+            for lic in active_lics:
+                lic_type_name = str(lic['type']).strip().upper()
+                if lic_type_name in tried_types:
+                    continue
+                max_start = lic['sim_bal'] - 1.00
+                if max_start <= 0.01:
+                    continue
+                total_avail = sum(
+                    max(0.0, l['sim_bal'] - 1.00)
+                    for l in active_lics
+                    if str(l['type']).strip().upper() == lic_type_name
+                )
+                if total_avail >= duty:
+                    allocated_type = lic_type_name
+                    break
+                else:
+                    tried_types.add(lic_type_name)
+                    
+            if not allocated_type:
+                continue
+                
+            duty_remaining = duty
+            for lic in active_lics:
+                if duty_remaining <= 0.005:
+                    break
+                if str(lic['type']).strip().upper() != allocated_type:
+                    continue
+                max_debitable = lic['sim_bal'] - 1.00
+                if max_debitable <= 0.01:
+                    continue
+                if max_debitable >= duty_remaining:
+                    lic['sim_bal'] -= duty_remaining
+                    lic['sim_used'] = True
+                    duty_remaining = 0
+                    break
+                else:
+                    debit_amt = max_debitable
+                    lic['sim_bal'] = 1.00
+                    lic['sim_used'] = True
+                    duty_remaining -= debit_amt
+                    
+        # Clear active licenses treeview
+        for item_id in self.blacklist_lic_tree.get_children():
+            self.blacklist_lic_tree.delete(item_id)
+            
+        self.blacklist_selected_lic_nos.clear()
+        
+        # Populate Active Licenses in Treeview, checking only the ones marked as sim_used
+        for l in active_lics:
+            expiry_str = l['expiry'].strftime('%d-%b-%Y') if l['expiry'] else ""
+            if l['sim_used']:
+                self.blacklist_lic_tree.insert(
+                    '', 
+                    'end', 
+                    values=("☑", l['lic_no'], l['port'], l['type'], f"{l['bal']:,.2f}", expiry_str),
+                    tags=('checked',)
+                )
+                self.blacklist_selected_lic_nos.add(l['lic_no'])
+            else:
+                self.blacklist_lic_tree.insert(
+                    '', 
+                    'end', 
+                    values=("☐", l['lic_no'], l['port'], l['type'], f"{l['bal']:,.2f}", expiry_str)
+                )
+            
+        self.recalc_blacklist_reallocation_metrics()
+
+    def _load_affected_items_failure(self, error_msg):
+        self.root.config(cursor="")
+        messagebox.showerror("Error", f"Failed to load affected items details:\n\n{error_msg}", parent=self.root)
+
+    def on_blacklist_tree_click(self, event):
+        """Toggle checkbox status on blacklist active licenses treeview row click."""
+        item_id = self.blacklist_lic_tree.identify_row(event.y)
+        if not item_id:
+            return
+            
+        values = list(self.blacklist_lic_tree.item(item_id, 'values'))
+        if values[0] == "☑":
+            values[0] = "☐"
+            self.blacklist_selected_lic_nos.discard(values[1])
+        else:
+            values[0] = "☑"
+            self.blacklist_selected_lic_nos.add(values[1])
+            
+        current_tags = list(self.blacklist_lic_tree.item(item_id, 'tags'))
+        if values[0] == "☑":
+            if 'checked' not in current_tags:
+                current_tags.append('checked')
+        else:
+            if 'checked' in current_tags:
+                current_tags.remove('checked')
+                
+        self.blacklist_lic_tree.item(item_id, values=values, tags=tuple(current_tags))
+        self.recalc_blacklist_reallocation_metrics()
+
+    def recalc_blacklist_reallocation_metrics(self):
+        """Re-simulate reallocation using the currently selected active licenses pool."""
+        selected_lics = []
+        for item_id in self.blacklist_lic_tree.get_children():
+            values = self.blacklist_lic_tree.item(item_id, 'values')
+            if values[0] == "☑":
+                lic_no = values[1]
+                matched_lic = next((l for l in self.blacklist_active_lics if l['lic_no'] == lic_no), None)
+                if matched_lic:
+                    selected_lics.append({
+                        'lic_no': matched_lic['lic_no'],
+                        'port': matched_lic['port'],
+                        'type': matched_lic['type'],
+                        'val': matched_lic['val'],
+                        'bal': matched_lic['bal'],
+                        'reg_date': matched_lic['reg_date'],
+                        'expiry': matched_lic['expiry'],
+                        'sim_bal': matched_lic['bal']
+                    })
+                    
+        # Sort using same priority rules: port matches first, then expiry date
+        import_port = self.blacklist_job_info.get('import_port', "")
+        # Preserve strict database sheet (top-to-bottom) order without sorting
+        sorted_lics = selected_lics
+        
+        reallocations_preview = []
+        all_covered = True
+        swapped_items = set()
+        
+        for alloc in self.blacklist_affected_items:
+            inv_sr = alloc['Inv_SrNo']
+            item_sr = alloc['Item_SrNo']
+            k = (inv_sr, item_sr)
+            if k in swapped_items:
+                continue
+                
+            duty = alloc['DebitDeutyValue']
+            qty = alloc['DebitQuantity']
+            av = alloc['CIF_Value']
+            old_lic = alloc.get('License_No', '')
+            
+            if duty <= 0:
+                lic = sorted_lics[0] if sorted_lics else None
+                if lic:
+                    reallocations_preview.append({
+                        'Inv_SrNo': inv_sr,
+                        'Item_SrNo': item_sr,
+                        'Invoice_No': alloc['Invoice_No'],
+                        'Old_License_No': old_lic,
+                        'License_No': lic['lic_no'],
+                        'License_Type': lic['type'],
+                        'DebitDeutyValue': 0.00,
+                        'DebitQuantity': qty,
+                        'Product_Desc': alloc['Product_Desc'],
+                        'CTH': alloc['CTH'],
+                        'port_match': "YES" if lic['port'] == import_port else "NO",
+                        'status': 'success'
+                    })
+                else:
+                    reallocations_preview.append({
+                        'Inv_SrNo': inv_sr,
+                        'Item_SrNo': item_sr,
+                        'Invoice_No': alloc['Invoice_No'],
+                        'Old_License_No': old_lic,
+                        'License_No': "NO LICENSE SELECTED",
+                        'License_Type': "Unknown",
+                        'DebitDeutyValue': 0.00,
+                        'DebitQuantity': qty,
+                        'Product_Desc': alloc['Product_Desc'],
+                        'CTH': alloc['CTH'],
+                        'port_match': "NO",
+                        'status': 'error'
+                    })
+                    all_covered = False
+                continue
+                
+            # Priority 1: Same type reallocation
+            # Find which license of the SAME type can cover this portion
+            allocated_type = None
+            tried_types = set()
+            allowed_type_str = str(alloc.get('Allowed_Type', '')).strip().upper()
+            
+            for lic in sorted_lics:
+                lic_type_name = str(lic['type']).strip().upper()
+                if lic_type_name in tried_types:
+                    continue
+                
+                # Check: Only allow this license type if it matches the item's Allowed_Type
+                is_match = True
+                if allowed_type_str:
+                    is_match = False
+                    if 'ROSCTL' in allowed_type_str and 'ROSCTL' in lic_type_name:
+                        is_match = True
+                    elif ('RODTEP' in allowed_type_str or 'RD' in allowed_type_str) and ('RODTEP' in lic_type_name or 'RD' in lic_type_name):
+                        is_match = True
+                    elif 'DFIA' in allowed_type_str and 'DFIA' in lic_type_name:
+                        is_match = True
+                    elif 'EPCG' in allowed_type_str and 'EPCG' in lic_type_name:
+                        is_match = True
+                    elif ('ADVANCE' in allowed_type_str or 'ADV' in allowed_type_str or 'AA' in allowed_type_str) and ('ADVANCE' in lic_type_name or 'ADV' in lic_type_name or 'AA' in lic_type_name):
+                        is_match = True
+                        
+                if is_match:
+                    max_start = lic['sim_bal'] - 1.00
+                    if max_start <= 0.01:
+                        continue
+                        
+                    total_avail = sum(
+                        max(0.0, l['sim_bal'] - 1.00)
+                        for l in sorted_lics
+                        if str(l['type']).strip().upper() == lic_type_name
+                    )
+                    if total_avail >= duty:
+                        allocated_type = lic_type_name
+                        break
+                    else:
+                        tried_types.add(lic_type_name)
+                        
+            # Priority 2: Different type swap for the entire item
+            swap_lic = None
+            if not allocated_type:
+                total_item_duty = alloc.get('Total_Item_Duty', duty)
+                for lic in sorted_lics:
+                    lic_type_name = str(lic['type']).strip().upper()
+                    
+                    # Must be a DIFFERENT type
+                    is_same = False
+                    if allowed_type_str:
+                        if 'ROSCTL' in allowed_type_str and 'ROSCTL' in lic_type_name:
+                            is_same = True
+                        elif ('RODTEP' in allowed_type_str or 'RD' in allowed_type_str) and ('RODTEP' in lic_type_name or 'RD' in lic_type_name):
+                            is_same = True
+                        elif 'DFIA' in allowed_type_str and 'DFIA' in lic_type_name:
+                            is_same = True
+                        elif 'EPCG' in allowed_type_str and 'EPCG' in lic_type_name:
+                            is_same = True
+                        elif ('ADVANCE' in allowed_type_str or 'ADV' in allowed_type_str or 'AA' in allowed_type_str) and ('ADVANCE' in lic_type_name or 'ADV' in lic_type_name or 'AA' in lic_type_name):
+                            is_same = True
+                            
+                    if is_same:
+                        continue
+                        
+                    # Must have enough balance for the entire item's duty
+                    if lic['sim_bal'] - 1.00 >= total_item_duty:
+                        swap_lic = lic
+                        break
+                        
+            if swap_lic:
+                swap_lic['sim_bal'] -= total_item_duty
+                swapped_items.add(k)
+                reallocations_preview.append({
+                    'Inv_SrNo': inv_sr,
+                    'Item_SrNo': item_sr,
+                    'Invoice_No': alloc['Invoice_No'],
+                    'Old_License_No': old_lic,
+                    'License_No': swap_lic['lic_no'],
+                    'License_Type': swap_lic['type'],
+                    'DebitDeutyValue': round(total_item_duty, 2),
+                    'DebitQuantity': alloc.get('Total_Item_Qty', qty),
+                    'Product_Desc': alloc['Product_Desc'],
+                    'CTH': alloc['CTH'],
+                    'port_match': "YES" if swap_lic['port'] == import_port else "NO",
+                    'status': 'success',
+                    'is_swap': True
+                })
+                continue
+                
+            if not allocated_type and not swap_lic:
+                reallocations_preview.append({
+                    'Inv_SrNo': inv_sr,
+                    'Item_SrNo': item_sr,
+                    'Invoice_No': alloc['Invoice_No'],
+                    'Old_License_No': old_lic,
+                    'License_No': "UNALLOCATED (LACKS BAL)",
+                    'License_Type': "Unknown",
+                    'DebitDeutyValue': round(duty, 2),
+                    'DebitQuantity': qty,
+                    'Product_Desc': alloc['Product_Desc'],
+                    'CTH': alloc['CTH'],
+                    'port_match': "NO",
+                    'status': 'error'
+                })
+                all_covered = False
+                continue
+                
+            # Allocate from selected licenses of this type (Priority 1)
+            duty_remaining = duty
+            for lic in sorted_lics:
+                if duty_remaining <= 0.005:
+                    break
+                if str(lic['type']).strip().upper() != allocated_type:
+                    continue
+                max_debitable = lic['sim_bal'] - 1.00
+                if max_debitable <= 0.01:
+                    continue
+                    
+                if max_debitable >= duty_remaining:
+                    lic['sim_bal'] -= duty_remaining
+                    reallocations_preview.append({
+                        'Inv_SrNo': inv_sr,
+                        'Item_SrNo': item_sr,
+                        'Invoice_No': alloc['Invoice_No'],
+                        'Old_License_No': old_lic,
+                        'License_No': lic['lic_no'],
+                        'License_Type': lic['type'],
+                        'DebitDeutyValue': round(duty_remaining, 2),
+                        'DebitQuantity': qty,
+                        'Product_Desc': alloc['Product_Desc'],
+                        'CTH': alloc['CTH'],
+                        'port_match': "YES" if lic['port'] == import_port else "NO",
+                        'status': 'success'
+                    })
+                    duty_remaining = 0
+                    break
+                else:
+                    debit_amt = max_debitable
+                    lic['sim_bal'] = 1.00
+                    ratio = debit_amt / duty
+                    reallocations_preview.append({
+                        'Inv_SrNo': inv_sr,
+                        'Item_SrNo': item_sr,
+                        'Invoice_No': alloc['Invoice_No'],
+                        'Old_License_No': old_lic,
+                        'License_No': lic['lic_no'],
+                        'License_Type': lic['type'],
+                        'DebitDeutyValue': round(debit_amt, 2),
+                        'DebitQuantity': round(qty * ratio, 3),
+                        'Product_Desc': alloc['Product_Desc'],
+                        'CTH': alloc['CTH'],
+                        'port_match': "YES" if lic['port'] == import_port else "NO",
+                        'status': 'success'
+                    })
+                    duty_remaining -= debit_amt
+                    
+        # Update proposed treeview preview
+        for item_id in self.blacklist_proposed_tree.get_children():
+            self.blacklist_proposed_tree.delete(item_id)
+            
+        for p in reallocations_preview:
+            tag = p['status']
+            self.blacklist_proposed_tree.insert(
+                '', 
+                'end', 
+                values=(
+                    p['Invoice_No'],
+                    p['Item_SrNo'],
+                    p['Product_Desc'],
+                    f"{p['DebitDeutyValue']:,.2f}",
+                    p['License_No'],
+                    p['port_match']
+                ),
+                tags=(tag,)
+            )
+            
+        # Update details summary text
+        job_no = self.blacklist_job_info.get('job_no', 'Unknown')
+        lics_to_bl = ", ".join(self.blacklist_selected_to_blacklist)
+        lic_type = self.blacklist_job_info.get('lic_type', 'Unknown')
+        total_duty = sum(a['DebitDeutyValue'] for a in self.blacklist_affected_items)
+        covered_duty = sum(p['DebitDeutyValue'] for p in reallocations_preview if p['status'] == 'success')
+        
+        status_text = (
+            f"Job Number: {job_no}\n"
+            f"Import Port: {import_port}\n"
+            f"Licenses to Blacklist: {lics_to_bl} ({lic_type})\n"
+            f"Total Reallocation Duty: {total_duty:,.2f} INR\n"
+            f"Duty Covered: {covered_duty:,.2f} INR\n"
+            f"Status: "
+        )
+        if total_duty > 0:
+            if covered_duty > 0:
+                if all_covered:
+                    status_text += "READY FOR REALLOCATION"
+                else:
+                    status_text += "PARTIAL REALLOCATION READY (Some items will be skipped due to low balance)"
+            else:
+                status_text += "READY FOR REALLOCATION (All items will be unallocated / cleared to pending)"
+            self.blacklist_execute_btn.config(state='normal')
+        else:
+            status_text += "No items to reallocate."
+            self.blacklist_execute_btn.config(state='disabled')
+            
+        self.blacklist_summary_lbl.config(text=status_text)
+        self.blacklist_reallocations_preview = reallocations_preview
+
+    def run_blacklist_reallocation(self):
+        jd_path = self.blacklist_jd_path.get().strip()
+        lics_to_blacklist = list(self.blacklist_selected_to_blacklist)
+        reason = self.blacklist_reason_entry.get().strip()
+        
+        if not jd_path or not lics_to_blacklist:
+            messagebox.showerror("Error", "Configure JobData and select one or more licenses to blacklist.", parent=self.root)
+            return
+            
+        if not reason:
+            if not messagebox.askyesno("Confirm", "You have not provided a reason for blacklisting. Proceed anyway?", parent=self.root):
+                return
+                
+        self.root.config(cursor="watch")
+        self.blacklist_execute_btn.config(state='disabled')
+        self.blacklist_parse_btn.config(state='disabled')
+        self.log(f"Initiating Blacklist & Re-allocation of licenses {', '.join(lics_to_blacklist)}...")
+        
+        threading.Thread(target=self._blacklist_reallocation_worker, args=(jd_path, lics_to_blacklist, reason), daemon=True).start()
+
+    def _blacklist_reallocation_worker(self, jd_path, lics_to_blacklist, reason):
+        try:
+            job_no = self.blacklist_job_info.get('job_no', 'Unknown')
+            lic_type = self.blacklist_job_info.get('lic_type', 'Unknown')
+            
+            lic_details_map = {l['lic_no']: l for l in self.blacklist_active_lics}
+            lics_set = set(lics_to_blacklist)
+            
+            swapped_items_map = {}
+            reallocated_rows = []
+            reallocations_api = []
+            skipped_reallocations = []
+            failed_keys = set()
+            
+            for p in self.blacklist_reallocations_preview:
+                old_lic = p.get('Old_License_No', '')
+                match_affected = next(
+                    (a for a in self.blacklist_affected_items 
+                     if a['Inv_SrNo'] == p['Inv_SrNo'] 
+                     and a['Item_SrNo'] == p['Item_SrNo'] 
+                     and a['License_No'] == old_lic), 
+                    {}
+                )
+                
+                if p['status'] == 'success':
+                    lic_no = p['License_No']
+                    lic_obj = lic_details_map.get(lic_no, {})
+                    
+                    reg_date_str = lic_obj.get('reg_date').strftime('%d-%b-%Y') if lic_obj.get('reg_date') else ""
+                    port_str = lic_obj.get('port', "")
+                    
+                    is_swap = p.get('is_swap', False)
+                    if is_swap:
+                        swapped_items_map[(p['Inv_SrNo'], p['Item_SrNo'])] = lic_no
+                        reallocated_rows.append({
+                            'Inv_SrNo': p['Inv_SrNo'],
+                            'Item_SrNo': p['Item_SrNo'],
+                            'License_No': lic_no,
+                            'License_Date': reg_date_str,
+                            'License_RegNo': lic_no,
+                            'License_RegDate': reg_date_str,
+                            'Reg_Port': port_str,
+                            'CIF_Value': match_affected.get('CIF_Value', 0.0),
+                            'DebitDeutyValue': p['DebitDeutyValue'],
+                            'DebitQuantity': p['DebitQuantity'],
+                            'DebitQuantityUnitCode': match_affected.get('DebitQuantityUnitCode', "")
+                        })
+                        reallocations_api.append({
+                            'old_lic': old_lic,
+                            'new_lic': lic_no,
+                            'val': match_affected.get('DebitDeutyValue', 0.0),
+                            'inv_no': p['Invoice_No'],
+                            'inv_sr_no': p['Inv_SrNo'],
+                            'item_sr_no': p['Item_SrNo'],
+                            'desc': p['Product_Desc'],
+                            'job_no': job_no
+                        })
+                    else:
+                        reallocated_rows.append({
+                            'Inv_SrNo': p['Inv_SrNo'],
+                            'Item_SrNo': p['Item_SrNo'],
+                            'License_No': lic_no,
+                            'License_Date': reg_date_str,
+                            'License_RegNo': lic_no,
+                            'License_RegDate': reg_date_str,
+                            'Reg_Port': port_str,
+                            'CIF_Value': match_affected.get('CIF_Value', 0.0),
+                            'DebitDeutyValue': p['DebitDeutyValue'],
+                            'DebitQuantity': p['DebitQuantity'],
+                            'DebitQuantityUnitCode': match_affected.get('DebitQuantityUnitCode', "")
+                        })
+                        reallocations_api.append({
+                            'old_lic': old_lic,
+                            'new_lic': lic_no,
+                            'val': p['DebitDeutyValue'],
+                            'inv_no': p['Invoice_No'],
+                            'inv_sr_no': p['Inv_SrNo'],
+                            'item_sr_no': p['Item_SrNo'],
+                            'desc': p['Product_Desc'],
+                            'job_no': job_no
+                        })
+                else:
+                    skipped_reallocations.append(p)
+                    failed_keys.add((p['Inv_SrNo'], p['Item_SrNo']))
+                    # For skipped items, restore balance on old license, but do not debit any new license (new_lic: "")
+                    reallocations_api.append({
+                        'old_lic': old_lic,
+                        'new_lic': "",
+                        'val': p['DebitDeutyValue'],
+                        'inv_no': p['Invoice_No'],
+                        'inv_sr_no': p['Inv_SrNo'],
+                        'item_sr_no': p['Item_SrNo'],
+                        'desc': p['Product_Desc'],
+                        'job_no': job_no
+                    })
+                
+            # 1. Modify the local processed JobData Excel file
+            self.safe_log("Modifying local Excel file...")
+            wb_write = openpyxl.load_workbook(jd_path, data_only=False)
+            ws_write_lic = wb_write['LICENSE']
+            ws_write_items = wb_write['ITEMS']
+            
+            # Read and keep other license rows, excluding those that belong to failed reallocations!
+            other_allocations = []
+            lic_rows_raw = list(ws_write_lic.iter_rows(values_only=True))
+            
+            # Create a lookup for preview details (Invoice_No and Product_Desc) to use for secondary license API payload
+            preview_map = {(p['Inv_SrNo'], p['Item_SrNo']): p for p in self.blacklist_reallocations_preview}
+            
+            for row in lic_rows_raw[1:]:
+                if len(row) > 3 and row[3]:
+                    row_inv_sr = str(row[0]).strip()
+                    row_item_sr = str(row[1]).strip()
+                    row_lic_no = str(row[3]).strip()
+                    k = (row_inv_sr, row_item_sr)
+                    
+                    if row_lic_no in lics_set:
+                        # This is a blacklisted license row. Ignore (handled above)
+                        continue
+                        
+                    if k in failed_keys:
+                        # This item failed reallocation of its blacklisted license!
+                        # As per user directive, we MUST remove ALL other licenses from it too.
+                        # We do NOT write this row back to the Excel.
+                        # And we MUST restore its balance in Google Sheets!
+                        p_obj = preview_map.get(k, {})
+                        reallocations_api.append({
+                            'old_lic': row_lic_no,
+                            'new_lic': "",
+                            'val': safe_float(row[10]),
+                            'inv_no': p_obj.get('Invoice_No', f"Inv-{row_inv_sr}"),
+                            'inv_sr_no': row_inv_sr,
+                            'item_sr_no': row_item_sr,
+                            'desc': p_obj.get('Product_Desc', ''),
+                            'job_no': job_no
+                        })
+                        self.safe_log(f"Removing secondary active license {row_lic_no} from failed item (InvSrNo: {row_inv_sr}, ItemSrNo: {row_item_sr}) to prevent partial allocation.")
+                    elif k in swapped_items_map:
+                        # This item was swapped to a different type license!
+                        # We remove this active license row from the Excel (handled under the single new swap row)
+                        # and update Google Sheets by replacing this active license with the new swapped license.
+                        p_obj = preview_map.get(k, {})
+                        reallocations_api.append({
+                            'old_lic': row_lic_no,
+                            'new_lic': swapped_items_map[k],
+                            'val': safe_float(row[10]),
+                            'inv_no': p_obj.get('Invoice_No', f"Inv-{row_inv_sr}"),
+                            'inv_sr_no': row_inv_sr,
+                            'item_sr_no': row_item_sr,
+                            'desc': p_obj.get('Product_Desc', ''),
+                            'job_no': job_no
+                        })
+                        self.safe_log(f"Swapping secondary active license {row_lic_no} to new license {swapped_items_map[k]} for swapped item (InvSrNo: {row_inv_sr}, ItemSrNo: {row_item_sr}).")
+                    else:
+                        other_allocations.append(row)
+                        
+            # Clear and rewrite LICENSE sheet
+            max_r = ws_write_lic.max_row
+            if max_r > 1:
+                ws_write_lic.delete_rows(2, max_r)
+                
+            write_idx = 2
+            # Write back other unchanged rows
+            for row in other_allocations:
+                for c_idx, val in enumerate(row, start=1):
+                    ws_write_lic.cell(row=write_idx, column=c_idx, value=val)
+                write_idx += 1
+                
+            # Write back successfully reallocated rows
+            for row in reallocated_rows:
+                ws_write_lic.cell(row=write_idx, column=1, value=row['Inv_SrNo'])
+                ws_write_lic.cell(row=write_idx, column=2, value=row['Item_SrNo'])
+                ws_write_lic.cell(row=write_idx, column=3, value=None)
+                ws_write_lic.cell(row=write_idx, column=4, value=row['License_No'])
+                ws_write_lic.cell(row=write_idx, column=5, value=row['License_Date'])
+                ws_write_lic.cell(row=write_idx, column=6, value=row['License_RegNo'])
+                ws_write_lic.cell(row=write_idx, column=7, value=row['License_RegDate'])
+                ws_write_lic.cell(row=write_idx, column=8, value=row['Reg_Port'])
+                ws_write_lic.cell(row=write_idx, column=9, value=1)
+                ws_write_lic.cell(row=write_idx, column=10, value=row['CIF_Value'])
+                ws_write_lic.cell(row=write_idx, column=11, value=row['DebitDeutyValue'])
+                ws_write_lic.cell(row=write_idx, column=12, value=row['DebitQuantity'])
+                ws_write_lic.cell(row=write_idx, column=13, value=row['DebitQuantityUnitCode'])
+                write_idx += 1
+                
+            # Update ITEMS sheet notification columns based on new allocations
+            item_last_lic = { (r['Inv_SrNo'], r['Item_SrNo']): r['License_No'] for r in reallocated_rows }
+            item_last_lic_type = {}
+            for p in self.blacklist_reallocations_preview:
+                if p['status'] == 'success':
+                    item_last_lic_type[(p['Inv_SrNo'], p['Item_SrNo'])] = p.get('License_Type', 'RODTEP')
+            
+            items_header_write = [str(ws_write_items.cell(row=1, column=c).value).strip() for c in range(1, ws_write_items.max_column + 1)]
+            w_inv_sr_idx = items_header_write.index('InvSrNo') + 1
+            w_item_sr_idx = items_header_write.index('ItemSrNo') + 1
+            
+            w_exim_code_idx = items_header_write.index('Exim_Code') + 1 if 'Exim_Code' in items_header_write else -1
+            
+            w_exim_notn_idx = -1
+            for name in ['Exim_Notn', 'Exim_Notification']:
+                if name in items_header_write:
+                    w_exim_notn_idx = items_header_write.index(name) + 1
+                    break
+                    
+            w_exim_notn_sr_idx = -1
+            for name in ['Exim_NotnSrNo', 'Exim_Notification_SrNo']:
+                if name in items_header_write:
+                    w_exim_notn_sr_idx = items_header_write.index(name) + 1
+                    break
+                    
+            w_duty_exemption_idx = items_header_write.index('Duty_Exemption_Amount') + 1 if 'Duty_Exemption_Amount' in items_header_write else -1
+            
+            affected_keys = { (a['Inv_SrNo'], a['Item_SrNo']) for a in self.blacklist_affected_items }
+            
+            for row_idx in range(2, ws_write_items.max_row + 1):
+                inv_val = str(ws_write_items.cell(row=row_idx, column=w_inv_sr_idx).value or "").strip()
+                itm_val = str(ws_write_items.cell(row=row_idx, column=w_item_sr_idx).value or "").strip()
+                k = (inv_val, itm_val)
+                
+                if k in item_last_lic:
+                    new_lic_type = str(item_last_lic_type.get(k, 'RODTEP')).strip().upper()
+                    
+                    exim_code_val = 'RD'
+                    exim_notn_val = 'RODTEP'
+                    exim_notn_sr_val = 1
+                    
+                    if 'ROSCTL' in new_lic_type:
+                        exim_code_val = 'RS'
+                        exim_notn_val = 'ROSCTL'
+                        exim_notn_sr_val = 1
+                    elif 'RODTEP' in new_lic_type or 'RD' in new_lic_type:
+                        exim_code_val = 'RD'
+                        exim_notn_val = 'RODTEP'
+                        exim_notn_sr_val = 1
+                    elif 'DFIA' in new_lic_type:
+                        exim_code_val = 'DF'
+                        exim_notn_val = 'DFIA'
+                        exim_notn_sr_val = 1
+                    elif 'ADVANCE' in new_lic_type or 'ADV' in new_lic_type or 'AA' in new_lic_type:
+                        exim_code_val = 'AA'
+                        exim_notn_val = 'ADVANCE AUTHORISATION'
+                        exim_notn_sr_val = 1
+                    elif 'EPCG' in new_lic_type or 'EP' in new_lic_type:
+                        exim_code_val = 'EP'
+                        exim_notn_val = 'EPCG'
+                        exim_notn_sr_val = 1
+                        
+                    if w_exim_code_idx != -1:
+                        ws_write_items.cell(row=row_idx, column=w_exim_code_idx, value=exim_code_val)
+                    if w_exim_notn_idx != -1:
+                        ws_write_items.cell(row=row_idx, column=w_exim_notn_idx, value=exim_notn_val)
+                    if w_exim_notn_sr_idx != -1:
+                        ws_write_items.cell(row=row_idx, column=w_exim_notn_sr_idx, value=exim_notn_sr_val)
+                    if w_duty_exemption_idx != -1:
+                        ws_write_items.cell(row=row_idx, column=w_duty_exemption_idx, value="")
+                elif k in affected_keys:
+                    # Clear EXIM columns for failed/skipped items
+                    if w_exim_code_idx != -1:
+                        ws_write_items.cell(row=row_idx, column=w_exim_code_idx, value="")
+                    if w_exim_notn_idx != -1:
+                        ws_write_items.cell(row=row_idx, column=w_exim_notn_idx, value="")
+                    if w_exim_notn_sr_idx != -1:
+                        ws_write_items.cell(row=row_idx, column=w_exim_notn_sr_idx, value="")
+                    if w_duty_exemption_idx != -1:
+                        ws_write_items.cell(row=row_idx, column=w_duty_exemption_idx, value="")
+            
+            # Save rectified file
+            dir_name = os.path.dirname(jd_path)
+            orig_base = os.path.basename(jd_path)
+            date_stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            
+            ts_match = re.search(r'_(Processed|Rectified)_(\d{8}_\d{6})\.xlsx$', orig_base, re.IGNORECASE)
+            if ts_match:
+                output_name = orig_base[:ts_match.start()] + f"_Rectified_{date_stamp}.xlsx"
+            else:
+                output_name = re.sub(r'processed', 'Rectified', orig_base, flags=re.IGNORECASE)
+                if 'rectified' not in output_name.lower():
+                    clean_job_no_str = re.sub(r'[\\/*?:"<>|]', '_', job_no)
+                    output_name = f"JobData_{clean_job_no_str}_Rectified_{date_stamp}.xlsx"
+                    
+            output_path = os.path.join(dir_name, output_name)
+            
+            wb_write.save(output_path)
+            wb_write.close()
+            
+            # 2. Parse previously skipped items from existing Pending Items report if it exists
+            previously_skipped = []
+            orig_txt_path = jd_path.replace(".xlsx", "_Pending_Items_Low_Balance.txt")
+            if os.path.exists(orig_txt_path):
+                try:
+                    with open(orig_txt_path, "r", encoding="utf-8") as f_prev:
+                        lines = f_prev.readlines()
+                    sep_idx = -1
+                    for idx, line in enumerate(lines):
+                        if "---" in line:
+                            sep_idx = idx
+                            break
+                    if sep_idx != -1:
+                        for line in lines[sep_idx+1:]:
+                            line_str = line.strip()
+                            if not line_str:
+                                continue
+                            parts = [p.strip() for p in line_str.split("|")]
+                            if len(parts) >= 6:
+                                duty_val = safe_float(parts[4].replace(",", ""))
+                                previously_skipped.append({
+                                    'Inv_Sr': parts[1],
+                                    'Item_Sr': parts[2],
+                                    'Invoice_No': parts[3],
+                                    'Duty': duty_val,
+                                    'Product_Desc': parts[5]
+                                })
+                            elif len(parts) >= 4:
+                                duty_val = safe_float(parts[2].replace(",", ""))
+                                previously_skipped.append({
+                                    'Inv_Sr': "",
+                                    'Item_Sr': "",
+                                    'Invoice_No': parts[1],
+                                    'Duty': duty_val,
+                                    'Product_Desc': parts[3]
+                                })
+                except Exception as e:
+                    self.safe_log(f"Warning: Could not parse previous pending items report: {e}")
+
+            # Combine previously skipped and newly failed reallocation items
+            all_pending = []
+            seen_items = set()
+            
+            # Add previously skipped
+            for item in previously_skipped:
+                k = (item['Invoice_No'], item['Product_Desc'])
+                if k not in seen_items:
+                    seen_items.add(k)
+                    all_pending.append({
+                        'Inv_Sr': item['Inv_Sr'],
+                        'Item_Sr': item['Item_Sr'],
+                        'Invoice_No': item['Invoice_No'],
+                        'Duty': item['Duty'],
+                        'Product_Desc': item['Product_Desc']
+                    })
+            
+            # Add newly failed reallocation items
+            for item in skipped_reallocations:
+                total_item_duty = sum(
+                    safe_float(row[10])
+                    for row in lic_rows_raw[1:]
+                    if len(row) > 10 and str(row[0]).strip() == item['Inv_SrNo'] and str(row[1]).strip() == item['Item_SrNo']
+                )
+                k = (item['Invoice_No'], item['Product_Desc'])
+                if k not in seen_items:
+                    seen_items.add(k)
+                    all_pending.append({
+                        'Inv_Sr': item['Inv_SrNo'],
+                        'Item_Sr': item['Item_SrNo'],
+                        'Invoice_No': item['Invoice_No'],
+                        'Duty': total_item_duty,
+                        'Product_Desc': item['Product_Desc']
+                    })
+
+            if all_pending:
+                skipped_txt_path = output_path.replace(".xlsx", "_Pending_Items_Low_Balance.txt")
+                with open(skipped_txt_path, "w", encoding="utf-8") as f:
+                    f.write(f"JOB NUMBER: {job_no}\n")
+                    f.write("THE FOLLOWING ITEMS ARE PENDING DEBIT / REALLOCATION BECAUSE THE LICENSE BALANCE WAS TOO LOW TO COVER THEIR DUTY FULLY TO 0:\n\n")
+                    f.write(f"{'No.':<4} | {'InvSrNo':<8} | {'ItemSrNo':<8} | {'Invoice No.':<20} | {'Duty (INR)':<15} | {'Product Description'}\n")
+                    f.write("-" * 100 + "\n")
+                    for idx, item in enumerate(all_pending, start=1):
+                        f.write(f"{idx:<4} | {item['Inv_Sr']:<8} | {item['Item_Sr']:<8} | {item['Invoice_No']:<20} | {item['Duty']:<15,.2f} | {item['Product_Desc']}\n")
+                self.safe_log(f"Saved {len(all_pending)} pending items list to: {os.path.basename(skipped_txt_path)}")
+                
+            self.safe_log("JobData file saved locally. Updating cloud database ledger...")
+            
+            # 2. Push to Google Sheets API
+            url = self.google_sheet_url.get().strip()
+            payload = {
+                "action": "blacklist_license",
+                "token": self.security_token.get().strip(),
+                "lic_no": lics_to_blacklist,
+                "job_no": job_no,
+                "reason": reason,
+                "reallocations": reallocations_api
+            }
+            
+            response = requests.post(
+                url, 
+                json=payload, 
+                headers={"Content-Type": "application/json", "Connection": "close"}, 
+                timeout=30
+            )
+            if response.status_code != 200:
+                raise ConnectionError(f"Cloud update failed with status code: {response.status_code}")
+                
+            try:
+                res_bl = response.json()
+            finally:
+                response.close()
+                
+            if not res_bl.get("success"):
+                raise ValueError(res_bl.get("error", "Unknown Error"))
+                
+            self.gui_queue.put(lambda: self._blacklist_reallocation_success(output_path))
+            
+        except Exception as e:
+            err_msg = str(e)
+            self.gui_queue.put(lambda: self._blacklist_reallocation_failure(err_msg))
+
+    def _blacklist_reallocation_success(self, output_path):
+        self.root.config(cursor="")
+        self.blacklist_execute_btn.config(state='disabled')
+        self.blacklist_parse_btn.config(state='normal')
+        
+        pending_txt_path = output_path.replace(".xlsx", "_Pending_Items_Low_Balance.txt")
+        has_pending = os.path.exists(pending_txt_path)
+        
+        msg = f"Licenses blacklisted and debits re-allocated successfully!\n\nNew rectified file saved to:\n{os.path.basename(output_path)}"
+        if has_pending:
+            msg += f"\n\n⚠️ WARNING: Some items were skipped due to low license balances! A report listing all pending items has been saved to:\n{os.path.basename(pending_txt_path)}"
+            
+        messagebox.showinfo("Success", msg, parent=self.root)
+        
+        # Clear inputs
+        self.blacklist_jd_path.set('')
+        for item_id in self.blacklist_select_tree.get_children():
+            self.blacklist_select_tree.delete(item_id)
+        self.blacklist_selected_to_blacklist.clear()
+        self.blacklist_reason_entry.delete(0, tk.END)
+        self.blacklist_execute_btn.config(state='disabled')
+        
+        self.blacklist_summary_lbl.config(text="Please upload processed JobData and parse to view preview.")
+        for item_id in self.blacklist_lic_tree.get_children():
+            self.blacklist_lic_tree.delete(item_id)
+        for item_id in self.blacklist_proposed_tree.get_children():
+            self.blacklist_proposed_tree.delete(item_id)
+            
+        # Refresh blacklist and active databases
+        self.refresh_blacklist()
+        self.refresh_db_view()
+
+    def _blacklist_reallocation_failure(self, error_msg):
+        self.root.config(cursor="")
+        self.blacklist_execute_btn.config(state='normal')
+        self.blacklist_parse_btn.config(state='normal')
+        messagebox.showerror("Error", f"Failed to re-allocate debits:\n\n{error_msg}", parent=self.root)
+
+    def refresh_blacklist(self):
+        url = self.google_sheet_url.get().strip()
+        if not url:
+            messagebox.showerror("Error", "Google Web App URL is not configured.")
+            return
+        self.root.config(cursor="watch")
+        self.log("Loading blacklisted licenses from Google Sheets...")
+        
+        threading.Thread(target=self._refresh_blacklist_worker, args=(url,), daemon=True).start()
+
+    def _refresh_blacklist_worker(self, url):
+        try:
+            payload = {
+                "action": "fetch",
+                "token": self.security_token.get().strip()
+            }
+            headers = {"Content-Type": "application/json", "Connection": "close"}
+            response = requests.post(url, json=payload, headers=headers, timeout=20)
+            if response.status_code != 200:
+                raise ConnectionError(f"Cloud fetch failed with status: {response.status_code}")
+                
+            try:
+                res = response.json()
+            finally:
+                response.close()
+                
+            if not res.get("success"):
+                raise ValueError(res.get("error", "Unknown Error"))
+                
+            blacklist_rows = res.get("blacklist", [])
+            self.gui_queue.put(lambda: self._refresh_blacklist_success(blacklist_rows))
+        except Exception as e:
+            err_msg = str(e)
+            self.gui_queue.put(lambda: self._refresh_blacklist_failure(err_msg))
+
+    def _refresh_blacklist_success(self, blacklist_rows):
+        self.root.config(cursor="")
+        for item_id in self.blacklist_tree.get_children():
+            self.blacklist_tree.delete(item_id)
+            
+        self.blacklist_licenses = []
+        if len(blacklist_rows) > 1:
+            header = [str(h).strip().upper() for h in blacklist_rows[0]]
+            lic_idx = header.index('LICNO/') if 'LICNO/' in header else 0
+            date_idx = header.index('DATE BLACKLISTED') if 'DATE BLACKLISTED' in header else 1
+            reason_idx = header.index('REASON') if 'REASON' in header else 2
+            
+            ldate_idx = header.index('LIC DATE') if 'LIC DATE' in header else -1
+            port_idx = header.index('PORT OF REGISTRATION') if 'PORT OF REGISTRATION' in header else -1
+            type_idx = header.index('LICENCE TYPE') if 'LICENCE TYPE' in header else -1
+            val_idx = header.index('VALUE') if 'VALUE' in header else -1
+            exp_idx = header.index('EXPIRY DATE') if 'EXPIRY DATE' in header else -1
+            
+            for row in blacklist_rows[1:]:
+                if len(row) > lic_idx and row[lic_idx]:
+                    lic_no = str(row[lic_idx]).strip()
+                    date_bl = str(row[date_idx]).strip()
+                    reason = str(row[reason_idx]).strip()
+                    
+                    self.blacklist_tree.insert('', 'end', values=(lic_no, date_bl, reason))
+                    
+                    self.blacklist_licenses.append({
+                        'lic_no': lic_no,
+                        'date_bl': date_bl,
+                        'reason': reason,
+                        'date': str(row[ldate_idx]).strip() if ldate_idx != -1 and ldate_idx < len(row) else "",
+                        'port': str(row[port_idx]).strip() if port_idx != -1 and port_idx < len(row) else "",
+                        'type': str(row[type_idx]).strip() if type_idx != -1 and type_idx < len(row) else "",
+                        'val': str(row[val_idx]).strip() if val_idx != -1 and val_idx < len(row) else "",
+                        'expiry': str(row[exp_idx]).strip() if exp_idx != -1 and exp_idx < len(row) else ""
+                    })
+        self.log(f"Successfully loaded {len(self.blacklist_licenses)} blacklisted licenses.")
+
+    def _refresh_blacklist_failure(self, error_msg):
+        self.root.config(cursor="")
+        self.log(f"Failed to load blacklist: {error_msg}")
+        messagebox.showerror("Error", f"Failed to refresh blacklist:\n\n{error_msg}", parent=self.root)
+
+    def on_blacklist_row_selected(self, event):
+        selected = self.blacklist_tree.selection()
+        if not selected:
+            self.rectify_restore_btn.config(state='disabled')
+            return
+            
+        item_values = self.blacklist_tree.item(selected[0], 'values')
+        lic_no = item_values[0]
+        
+        matched = None
+        for l in self.blacklist_licenses:
+            if l['lic_no'] == lic_no:
+                matched = l
+                break
+                
+        if matched:
+            self.rectify_fields['lic_no'].set(matched['lic_no'])
+            self.rectify_fields['date'].set(matched['date'])
+            self.rectify_fields['port'].set(matched['port'])
+            self.rectify_fields['type'].set(matched['type'])
+            self.rectify_fields['val'].set(matched['val'])
+            self.rectify_fields['expiry'].set(matched['expiry'])
+            
+            self.rectify_restore_btn.config(state='normal')
+
+    def run_rectify_restore(self):
+        lic_no = self.rectify_fields['lic_no'].get().strip()
+        if not lic_no:
+            return
+            
+        edited_data = {
+            'date': self.rectify_fields['date'].get().strip(),
+            'port': self.rectify_fields['port'].get().strip(),
+            'type': self.rectify_fields['type'].get().strip(),
+            'val': self.rectify_fields['val'].get().strip(),
+            'expiry': self.rectify_fields['expiry'].get().strip()
+        }
+        
+        if not (edited_data['date'] and edited_data['port'] and edited_data['type'] and edited_data['val'] and edited_data['expiry']):
+            messagebox.showerror("Error", "Please fill in all details for rectification.", parent=self.root)
+            return
+            
+        try:
+            float(edited_data['val'])
+        except ValueError:
+            messagebox.showerror("Error", "License Value must be a valid number.", parent=self.root)
+            return
+            
+        self.root.config(cursor="watch")
+        self.rectify_restore_btn.config(state='disabled')
+        self.log(f"Rectifying and restoring license {lic_no} to active pool...")
+        
+        threading.Thread(target=self._rectify_restore_worker, args=(lic_no, edited_data), daemon=True).start()
+
+    def _rectify_restore_worker(self, lic_no, edited_data):
+        try:
+            url = self.google_sheet_url.get().strip()
+            payload = {
+                "action": "rectify_license",
+                "token": self.security_token.get().strip(),
+                "lic_no": lic_no,
+                "edited_data": edited_data
+            }
+            headers = {"Content-Type": "application/json", "Connection": "close"}
+            response = requests.post(url, json=payload, headers=headers, timeout=20)
+            if response.status_code != 200:
+                raise ConnectionError(f"Cloud update failed with status: {response.status_code}")
+                
+            try:
+                res = response.json()
+            finally:
+                response.close()
+                
+            if not res.get("success"):
+                raise ValueError(res.get("error", "Unknown Error"))
+                
+            self.gui_queue.put(lambda: self._rectify_restore_success())
+        except Exception as e:
+            err_msg = str(e)
+            self.gui_queue.put(lambda: self._rectify_restore_failure(err_msg))
+
+    def _rectify_restore_success(self):
+        self.root.config(cursor="")
+        messagebox.showinfo("Success", "License rectified and restored to the active pool successfully!", parent=self.root)
+        for var in self.rectify_fields.values():
+            var.set('')
+        self.rectify_restore_btn.config(state='disabled')
+        self.refresh_blacklist()
+        self.refresh_db_view()
+
+    def _rectify_restore_failure(self, error_msg):
+        self.root.config(cursor="")
+        self.rectify_restore_btn.config(state='normal')
+        messagebox.showerror("Error", f"Failed to restore license:\n\n{error_msg}", parent=self.root)
+
+    def _rectify_reallocation_success(self, output_path):
+        self.root.config(cursor="")
+        self.rectify_execute_btn.config(state='normal')
+        self.rectify_parse_btn.config(state='normal')
+        
+        messagebox.showinfo("Success", f"License blacklisted and debits re-allocated successfully!\n\nNew rectified file saved to:\n{os.path.basename(output_path)}", parent=self.root)
+        
+        # Clear inputs
+        self.rectify_jd_path.set('')
+        self.rectify_lic_combo['values'] = []
+        self.rectify_lic_combo.set('')
+        self.rectify_reason_entry.delete(0, tk.END)
+        self.rectify_execute_btn.config(state='disabled')
+        
+        # Refresh blacklist list and active list
+        self.refresh_blacklist()
+        self.refresh_db_view()
+
+    def _rectify_reallocation_failure(self, error_msg):
+        self.root.config(cursor="")
+        self.rectify_execute_btn.config(state='normal')
+        self.rectify_parse_btn.config(state='normal')
+        messagebox.showerror("Error", f"Failed to re-allocate debits:\n\n{error_msg}", parent=self.root)
+
     def process_gui_queue(self):
         """Consume callbacks in the main thread to update the GUI safely."""
         try:
@@ -704,11 +2391,12 @@ class LicenseAutomationApp:
                 raise ValueError(res.get("error", "Unknown Error"))
                 
             data_rows = res.get("data", [])
-            self.gui_queue.put(lambda: self._refresh_db_view_success(data_rows))
+            used_rows = res.get("used", [])
+            self.gui_queue.put(lambda: self._refresh_db_view_success(data_rows, used_rows))
         except Exception as e:
             self.safe_log(f"Failed to refresh DB view: {e}")
 
-    def _refresh_db_view_success(self, data_rows):
+    def _refresh_db_view_success(self, data_rows, used_rows):
         for item_id in self.db_tree.get_children():
             self.db_tree.delete(item_id)
             
@@ -732,6 +2420,7 @@ class LicenseAutomationApp:
             self.log(f"Database sheet format error: missing column: {e}")
             return
             
+        self.active_licenses = []
         for r in data_rows[1:]:
             if len(r) <= max(lic_idx, bal_idx):
                 continue
@@ -747,6 +2436,7 @@ class LicenseAutomationApp:
                 exp_date = self.parse_sheet_date(exp_val)
                 exp_str = exp_date.strftime('%d-%b-%Y') if exp_date else exp_val
             else:
+                exp_date = None
                 exp_str = "N/A"
                 
             lic_date_val = r[date_idx]
@@ -754,6 +2444,7 @@ class LicenseAutomationApp:
                 lic_date = self.parse_sheet_date(lic_date_val)
                 lic_date_str = lic_date.strftime('%d-%b-%Y') if lic_date else lic_date_val
             else:
+                lic_date = None
                 lic_date_str = "N/A"
                 
             self.db_tree.insert('', 'end', values=(
@@ -768,6 +2459,60 @@ class LicenseAutomationApp:
                 f"{bal_val:.2f}",
                 str(r[job_idx] or "").strip()
             ))
+            
+            # Keep in-memory active licenses list populated
+            self.active_licenses.append({
+                'lic_no': lic_no,
+                'port': str(r[port_idx] or "").strip(),
+                'type': str(r[type_idx] or "").strip(),
+                'val': base_val,
+                'bal': bal_val,
+                'expiry': exp_date,
+                'reg_date': lic_date
+            })
+            
+        # Parse and cache Used License sheet rows
+        self.used_licenses = []
+        if used_rows and len(used_rows) > 1:
+            u_header = [str(h).strip().upper() for h in used_rows[0]]
+            try:
+                u_lic_idx = u_header.index('LICNO/')
+                u_port_idx = u_header.index('PORT OF REGISTRATION')
+                u_type_idx = u_header.index('LICENCE TYPE')
+                u_val_idx = u_header.index('VALUE')
+                u_bal_idx = u_header.index('BALANCE')
+                u_exp_idx = u_header.index('EXPIRY DATE')
+                u_date_idx = u_header.index('LIC DATE')
+                
+                for r in used_rows[1:]:
+                    if len(r) <= max(u_lic_idx, u_bal_idx):
+                        continue
+                    u_lic_no = str(r[u_lic_idx]).split('.')[0].strip()
+                    
+                    u_exp_val = r[u_exp_idx]
+                    if isinstance(u_exp_val, str) and u_exp_val.strip() and u_exp_val.strip().lower() != 'nan':
+                        u_exp_date = self.parse_sheet_date(u_exp_val)
+                    else:
+                        u_exp_date = None
+                        
+                    u_lic_date_val = r[u_date_idx]
+                    if isinstance(u_lic_date_val, str) and u_lic_date_val.strip() and u_lic_date_val.strip().lower() != 'nan':
+                        u_lic_date = self.parse_sheet_date(u_lic_date_val)
+                    else:
+                        u_lic_date = None
+                        
+                    self.used_licenses.append({
+                        'lic_no': u_lic_no,
+                        'port': str(r[u_port_idx] or "").strip(),
+                        'type': str(r[u_type_idx] or "").strip(),
+                        'val': safe_float(r[u_val_idx]),
+                        'bal': safe_float(r[u_bal_idx]),
+                        'expiry': u_exp_date,
+                        'reg_date': u_lic_date
+                    })
+            except Exception as e:
+                self.log(f"Failed parsing used licenses: {e}")
+                
         self.log("Database view updated.")
 
     def parse_pasted_text(self, text_content):
@@ -1008,53 +2753,49 @@ class LicenseAutomationApp:
     def _push_licenses_worker(self, url, licenses_payload, source_type):
         try:
             to_push = licenses_payload
-            self.safe_log(f"Pushing {len(to_push)} licenses to Google Sheets cloud (one-by-one check)...")
-            success_count = 0
-            error_details = []
+            self.safe_log(f"Pushing {len(to_push)} licenses to Google Sheets cloud in bulk...")
             
-            for idx, l in enumerate(to_push, start=1):
-                lic_no = l['lic_no']
-                self.safe_log(f"[{idx}/{len(to_push)}] Pushing license {lic_no}...")
-                
-                payload = {
-                    "action": "add_licenses",
-                    "token": self.security_token.get().strip(),
-                    "licenses": [l]
-                }
-                headers = {
-                    "Content-Type": "application/json",
-                    "Connection": "close"
-                }
+            payload = {
+                "action": "add_licenses",
+                "token": self.security_token.get().strip(),
+                "licenses": to_push
+            }
+            headers = {
+                "Content-Type": "application/json",
+                "Connection": "close"
+            }
+            
+            try:
+                response = requests.post(url, json=payload, headers=headers, timeout=30)
+                if response.status_code != 200:
+                    raise ConnectionError(f"HTTP status {response.status_code}")
                 
                 try:
-                    response = requests.post(url, json=payload, headers=headers, timeout=20)
-                    if response.status_code != 200:
-                        raise ConnectionError(f"HTTP status {response.status_code}")
+                    res = response.json()
+                except Exception:
+                    raise ValueError(humanize_error(response.text))
+                finally:
+                    response.close()
+                
+                if not res.get("success"):
+                    raise ValueError(res.get("error", "Unknown Error"))
                     
-                    try:
-                        res = response.json()
-                    except Exception:
-                        raise ValueError(humanize_error(response.text))
-                    finally:
-                        response.close()
-                    
-                    if not res.get("success"):
-                        raise ValueError(res.get("error", "Unknown Error"))
-                        
-                    success_count += 1
-                except Exception as e:
-                    self.safe_log(f"License {lic_no} failed validation: {e}")
-                    error_details.append((lic_no, str(e)))
-            
-            self.safe_log(f"Pusher finished: {success_count} added successfully, {len(error_details)} skipped/failed.")
-            self.gui_queue.put(lambda: self._push_licenses_success(source_type, success_count, 0, error_details))
-            
+                added_count = res.get("added", len(to_push))
+                skipped_count = res.get("skipped", 0)
+                
+                self.safe_log(f"Pusher finished: {added_count} added successfully, {skipped_count} duplicates skipped.")
+                self.gui_queue.put(lambda: self._push_licenses_success(source_type, added_count, skipped_count, []))
+                
+            except Exception as e:
+                self.safe_log(f"Bulk license push failed: {e}")
+                self.gui_queue.put(lambda: self._push_licenses_success(source_type, 0, len(to_push), [(l['lic_no'], str(e)) for l in to_push]))
+                
         except Exception as e:
             err_msg = str(e)
             self.safe_log(f"Critical error during license push: {err_msg}")
             self.gui_queue.put(lambda: self._push_licenses_failure(err_msg))
 
-    def _push_licenses_success(self, source_type, success_count, skipped_active_count, error_details):
+    def _push_licenses_success(self, source_type, success_count, skipped_count, error_details):
         self.paste_btn.config(state='normal')
         self.excel_btn.config(state='normal')
         self.root.config(cursor="")
@@ -1066,13 +2807,12 @@ class LicenseAutomationApp:
             
         summary_msg = f"Upload process completed:\n\n"
         summary_msg += f"✅ Successfully added: {success_count} new license(s)\n"
-        if skipped_active_count > 0:
-            summary_msg += f"ℹ️ Skipped (already active in Data sheet): {skipped_active_count} license(s)\n"
+        if skipped_count > 0:
+            summary_msg += f"ℹ️ Skipped (duplicates already in master): {skipped_count} license(s)\n"
         if error_details:
             summary_msg += f"❌ Skipped/Failed (cloud validation error): {len(error_details)} license(s)\n\n"
             summary_msg += "Validation details:\n"
             for lic_no, err in error_details[:5]:
-                # Extract clean error description if it's long
                 clean_err = str(err)
                 if "Google Sheets Script Error" in clean_err:
                     clean_err = clean_err.split("\n")[0]
@@ -1691,6 +3431,7 @@ class LicenseAutomationApp:
             
             self.safe_log("Running allocation algorithm...")
             job_license_rows = []
+            skipped_items = []
             license_debit_totals = {lic['lic_no']: 0.0 for lic in selected_lics}
             
             # Index items_rows by InvSrNo for O(1) subset lookup
@@ -1829,6 +3570,16 @@ class LicenseAutomationApp:
                         
                 if not allocated_type:
                     self.safe_log(f"Skipping item {idx+1} (Duty: {duty:.2f} INR) - Insufficient remaining balance in any single license type to cover it fully to 0.")
+                    skipped_items.append({
+                        'index': idx + 1,
+                        'invoice_no': rep_inv_no,
+                        'desc': rep_desc,
+                        'qty': rep_qty,
+                        'cth': rep_cth,
+                        'duty': duty,
+                        'inv_sr': inv_sr,
+                        'item_sr': item_sr
+                    })
                     continue
 
                 duty_remaining = duty
@@ -1971,6 +3722,17 @@ class LicenseAutomationApp:
             wb_jd.save(output_jd_path)
             wb_jd.close()
             self.safe_log(f"JobData saved successfully to: {os.path.basename(output_jd_path)}")
+            
+            if skipped_items:
+                skipped_txt_path = output_jd_path.replace(".xlsx", "_Pending_Items_Low_Balance.txt")
+                with open(skipped_txt_path, "w", encoding="utf-8") as f:
+                    f.write(f"JOB NUMBER: {self.job_info.get('job_no', 'Unknown')}\n")
+                    f.write("THE FOLLOWING ITEMS ARE PENDING DEBIT / REALLOCATION BECAUSE THE LICENSE BALANCE WAS TOO LOW TO COVER THEIR DUTY FULLY TO 0:\n\n")
+                    f.write(f"{'No.':<4} | {'InvSrNo':<8} | {'ItemSrNo':<8} | {'Invoice No.':<20} | {'Duty (INR)':<15} | {'Product Description'}\n")
+                    f.write("-" * 100 + "\n")
+                    for i, item in enumerate(skipped_items, start=1):
+                        f.write(f"{i:<4} | {item.get('inv_sr', ''):<8} | {item.get('item_sr', ''):<8} | {item['invoice_no']:<20} | {item['duty']:<15,.2f} | {item['desc']}\n")
+                self.safe_log(f"Saved {len(skipped_items)} pending items (low balance) list to: {os.path.basename(skipped_txt_path)}")
 
             # 6. Push Debits to Google Sheets cloud
             self.safe_log("Preparing debit data to push to Google Sheets cloud...")
@@ -1982,6 +3744,8 @@ class LicenseAutomationApp:
                     "val": data['DebitDeutyValue'],
                     "job_no": self.job_info['job_no'],
                     "inv_no": data['Invoice_No'],
+                    "inv_sr_no": data['Inv_SrNo'],
+                    "item_sr_no": data['Item_SrNo'],
                     "desc": data['Product_Desc'],
                     "av": data['CIF_Value'],
                     "rate": data['Basic_Duty_Rate'],
@@ -2025,17 +3789,26 @@ class LicenseAutomationApp:
         self.load_btn.config(state='normal')
         self.run_btn.config(state='disabled')
         
-        messagebox.showinfo("Success", f"License automation finished successfully!\n\n1. JobData updated and saved to:\n{os.path.basename(output_jd_path)}\n\n2. Google Sheets updated successfully in cloud.")
+        pending_txt_path = output_jd_path.replace(".xlsx", "_Pending_Items_Low_Balance.txt")
+        has_pending = os.path.exists(pending_txt_path)
+        
+        msg = f"License automation finished successfully!\n\n1. JobData updated and saved to:\n{os.path.basename(output_jd_path)}\n\n2. Google Sheets updated successfully in cloud."
+        if has_pending:
+            msg += f"\n\n⚠️ WARNING: Some items were skipped due to low license balances! A report listing all pending items has been saved to:\n{os.path.basename(pending_txt_path)}"
+            
+        messagebox.showinfo("Success", msg)
         
         # Clear input file paths after successful processing
         self.job_data_path.set("")
         self.item_report_path.set("")
         self.job_info = None
-        self.active_licenses = []
         self.item_duties = []
         self.required_duty = 0.0
         self.selected_duty_covered = 0.0
         self.estimated_debit = 0.0
+        
+        # Automatically refresh database view in the background to get updated balances
+        self.refresh_db_view()
         
         # Clear treeview and summary
         for item_id in self.lic_tree.get_children():
