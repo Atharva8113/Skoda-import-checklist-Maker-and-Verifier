@@ -767,6 +767,9 @@ function moveExistingUsedLicenses() {
   if (completedRows.length > 0) {
     usedLicSheet.getRange(2, 1, completedRows.length, completedRows[0].length).setValues(completedRows);
   }
+  
+  // Re-apply blacklist highlights after moving/shuffling rows
+  applyBlacklistHighlighting(ss);
 }
 
 function rebuildLicenseJobLists(ss, dataSheet) {
